@@ -31,6 +31,15 @@ Dépendances : aucune (bibliothèque standard Python 3.10+).
 -------------------------------------------------------------------------------
 CONFIGURATION (variables d'environnement)
 -------------------------------------------------------------------------------
+Toutes les variables ci-dessous peuvent être placées dans un fichier
+« config.env » situé à côté de ce script (facultatif), au format CLE=valeur,
+une par ligne ; les lignes vides et celles commençant par « # » sont ignorées.
+L'environnement réel l'emporte sur le fichier. Chemin surchargeable par
+PV_CONFIG_FILE. Ce fichier contient des secrets : ne le committez pas.
+
+  APS_APP_SECRET=xxxxxxxxxxxx
+  NTFY_TOPIC=pv-alerte-xyz123
+
 Obligatoires :
   APS_APP_ID          App Id  (32 caractères) fourni par APsystems
   APS_APP_SECRET      App Secret (12 caractères) fourni par APsystems
@@ -87,6 +96,52 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_FILE = Path(
+    os.getenv("PV_CONFIG_FILE", str(SCRIPT_DIR / "config.env"))
+).expanduser()
+
+
+def load_env_file(path: Path) -> None:
+    """Charge un fichier CLE=valeur dans os.environ. Absent = sans effet.
+
+    L'environnement réel l'emporte : le fichier ne fournit que des valeurs par
+    défaut, ce qui permet de surcharger ponctuellement une variable depuis le
+    shell ou la crontab sans éditer le fichier.
+
+    Un « # » n'est reconnu comme commentaire qu'en début de ligne : tronquer une
+    valeur au premier « # » mutilerait silencieusement un mot de passe ou un
+    token qui en contient un.
+    """
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        # log() n'existe pas encore à ce stade : LOG_FILE en dépend.
+        print(f"[config] lecture impossible de {path} : {exc}", file=sys.stderr)
+        return
+
+    for lineno, raw in enumerate(content.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            print(f"[config] {path}:{lineno} ignorée (format attendu CLE=valeur)",
+                  file=sys.stderr)
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+load_env_file(CONFIG_FILE)
 
 BASE_URL = "https://api.apsystemsema.com:9282"
 
