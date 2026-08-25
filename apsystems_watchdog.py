@@ -9,10 +9,15 @@ Surveillance d'une installation photovoltaïque APsystems via l'OpenAPI officiel
 
 Détecte :
   1. Le voyant système "light" != 1 (2 = alarme onduleur, 3 = ECU hors ligne,
-     4 = aucune donnée remontée)  -> couvre le cas "ECU débranché / plus de réseau"
-  2. Une puissance instantanée nulle alors que le soleil est suffisamment haut
-     -> couvre EXACTEMENT le cas "disjoncteur qui a sauté pendant l'orage"
-  3. L'API elle-même injoignable N fois de suite
+     4 = aucune donnée remontée). Attention : ce voyant est mis à jour très
+     paresseusement par le cloud APsystems, il ne suffit pas à lui seul.
+  2. Une puissance instantanée nulle alors que le soleil est suffisamment haut.
+  3. Des données figées : l'API continue de renvoyer le DERNIER point connu même
+     quand l'ECU ne remonte plus rien. C'est ce cas -- et non une puissance
+     nulle -- qui se produit réellement quand le disjoncteur saute ou que
+     l'installation est débranchée. Sans ce contrôle de fraîcheur, la panne est
+     totalement invisible.
+  4. L'API elle-même injoignable N fois de suite
 
 Envoie une alerte (ntfy / Telegram / e-mail SMTP) une seule fois par incident,
 puis un message de retour à la normale.
@@ -47,6 +52,10 @@ Réglages (facultatifs) :
                       la production. Défaut 15.
   PV_MIN_POWER_W      Seuil de puissance considéré comme "nul". Défaut 20 W.
   PV_GRACE_MINUTES    Durée de production nulle avant alerte. Défaut 60 min.
+  PV_MAX_DATA_AGE_MINUTES
+                      Âge maximal du dernier point de télémétrie avant de
+                      considérer que l'ECU ne remonte plus rien. Défaut 20 min
+                      (l'ECU publie toutes les ~5 min).
   PV_STATE_FILE       Fichier d'état. Défaut ~/.apsystems_watchdog.json
   PV_LOG_FILE         Fichier de log. Défaut ~/.apsystems_watchdog.log
   HEALTHCHECKS_URL    URL de ping Healthchecks.io (dead man's switch)
@@ -92,6 +101,7 @@ MIN_ELEVATION = float(os.getenv("PV_MIN_ELEVATION", "15"))
 MIN_POWER_W = float(os.getenv("PV_MIN_POWER_W", "20"))
 GRACE_MINUTES = int(os.getenv("PV_GRACE_MINUTES", "60"))
 MAX_API_FAILURES = int(os.getenv("PV_MAX_API_FAILURES", "3"))
+MAX_DATA_AGE_MINUTES = int(os.getenv("PV_MAX_DATA_AGE_MINUTES", "20"))
 
 STATE_FILE = Path(os.getenv("PV_STATE_FILE", "~/.apsystems_watchdog.json")).expanduser()
 LOG_FILE = Path(os.getenv("PV_LOG_FILE", "~/.apsystems_watchdog.log")).expanduser()
@@ -238,9 +248,13 @@ def _post(url: str, data: bytes, headers: dict) -> None:
     urllib.request.urlopen(req, timeout=TIMEOUT).read()
 
 
-def notify(title: str, message: str, urgent: bool = True) -> None:
-    """Envoie sur tous les canaux configurés. Un canal en échec n'en bloque pas un autre."""
+def notify(title: str, message: str, urgent: bool = True) -> bool:
+    """Envoie sur tous les canaux configurés. Un canal en échec n'en bloque pas un autre.
+
+    Retourne True si au moins un canal a effectivement reçu le message.
+    """
     sent = False
+    configured = bool(NTFY_TOPIC or (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) or SMTP_HOST)
 
     if NTFY_TOPIC:
         try:
@@ -292,7 +306,10 @@ def notify(title: str, message: str, urgent: bool = True) -> None:
             log(f"[smtp] échec : {exc}", err=True)
 
     if not sent:
-        log(f"[!] AUCUN canal de notification n'a fonctionné : {title} — {message}", err=True)
+        cause = ("AUCUN canal n'est configuré (NTFY_TOPIC / TELEGRAM_* / SMTP_*)"
+                 if not configured else "tous les canaux configurés ont échoué")
+        log(f"[!] Notification NON DÉLIVRÉE — {cause} : {title} — {message}", err=True)
+    return sent
 
 
 # --------------------------------------------------------------------------- #
@@ -341,6 +358,27 @@ def latest_power_w(sid: str, eid: str, day: str) -> tuple[float, str]:
         return 0.0, "?"
 
 
+def data_age_minutes(day: str, ts: str) -> float | None:
+    """Âge en minutes du point de télémétrie horodaté `ts`, ou None si illisible.
+
+    L'API ne dit jamais "je n'ai plus de données" : elle rejoue indéfiniment le
+    dernier point reçu. Seul son horodatage trahit un ECU muet.
+    """
+    stamp = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            stamp = datetime.strptime(f"{day} {ts}", fmt)
+            break
+        except ValueError:
+            continue
+    if stamp is None:
+        try:
+            stamp = datetime.fromisoformat(ts)
+        except ValueError:
+            return None
+    return (datetime.now() - stamp).total_seconds() / 60
+
+
 def collect() -> dict:
     """Retourne un instantané de l'installation."""
     details = api_get(f"/user/api/v2/systems/details/{SID}")
@@ -353,9 +391,10 @@ def collect() -> dict:
     per_ecu = {}
     for eid in ecus:
         try:
-            per_ecu[eid] = latest_power_w(SID, eid, day)
+            power, ts = latest_power_w(SID, eid, day)
+            per_ecu[eid] = (power, ts, data_age_minutes(day, ts))
         except Exception as exc:  # noqa: BLE001
-            per_ecu[eid] = (None, f"erreur: {exc}")
+            per_ecu[eid] = (None, f"erreur: {exc}", None)
 
     return {
         "light": int(details.get("light", 0)),
@@ -394,7 +433,9 @@ def run(dry_run: bool = False) -> int:
         return 1
 
     ecu_details = ", ".join(
-        f"{eid} = {power} W à {ts}" for eid, (power, ts) in snap["per_ecu"].items()
+        f"{eid} = {power} W à {ts}"
+        + (f" (il y a {age:.0f} min)" if age is not None else "")
+        for eid, (power, ts, age) in snap["per_ecu"].items()
     )
     summary = (
         f"Soleil : {elevation:.1f}°  |  Voyant : {snap['light']} "
@@ -412,7 +453,7 @@ def run(dry_run: bool = False) -> int:
 
     # --- 2. Production nulle en plein soleil -------------------------------- #
     zero_ecus = [
-        eid for eid, (power, _) in snap["per_ecu"].items()
+        eid for eid, (power, _, _) in snap["per_ecu"].items()
         if power is not None and power < MIN_POWER_W
     ]
 
@@ -433,7 +474,24 @@ def run(dry_run: bool = False) -> int:
     else:
         state.pop("zero_since", None)
 
-    # --- 3. Notification (une seule par incident, + retour à la normale) ---- #
+    # --- 3. Données figées : l'ECU ne remonte plus rien --------------------- #
+    # C'est LE symptôme réel d'un débranchement ou d'un disjoncteur qui a sauté :
+    # la puissance ne tombe pas à zéro, elle cesse simplement d'être mise à jour.
+    stale_ecus = [
+        (eid, age) for eid, (_, _, age) in snap["per_ecu"].items()
+        if age is not None and age > MAX_DATA_AGE_MINUTES
+    ]
+
+    if elevation >= MIN_ELEVATION and stale_ecus:
+        noms = ", ".join(f"{eid} (dernier point il y a {age:.0f} min)"
+                         for eid, age in stale_ecus)
+        problems.append(
+            f"Aucune donnée fraîche depuis plus de {MAX_DATA_AGE_MINUTES} min "
+            f"sur : {noms}. L'ECU ne remonte plus rien alors que le soleil est "
+            f"à {elevation:.0f}° au-dessus de l'horizon."
+        )
+
+    # --- 4. Notification (une seule par incident, + retour à la normale) ---- #
     was_alerting = state.get("alerting", False)
 
     if problems and not was_alerting:
@@ -441,7 +499,7 @@ def run(dry_run: bool = False) -> int:
             "\n".join(f"• {p}" for p in problems)
             + f"\n\nProduction du jour : {snap['today_kwh']} kWh"
             + f"\nPuissance instantanée : "
-            + ", ".join(f"{eid} = {p} W" for eid, (p, _) in snap["per_ecu"].items())
+            + ", ".join(f"{eid} = {p} W" for eid, (p, _, _) in snap["per_ecu"].items())
             + "\n\n👉 Vérifiez les disjoncteurs PV dans le garage, "
               "puis l'alimentation et le réseau de l'ECU."
         )
@@ -457,7 +515,7 @@ def run(dry_run: bool = False) -> int:
             notify(
                 "✅ Photovoltaïque : retour à la normale",
                 f"La production a repris.\nPuissance : "
-                + ", ".join(f"{eid} = {p} W" for eid, (p, _) in snap["per_ecu"].items())
+                + ", ".join(f"{eid} = {p} W" for eid, (p, _, _) in snap["per_ecu"].items())
                 + f"\nIncident ouvert depuis : {since}",
                 urgent=False,
             )
@@ -473,7 +531,7 @@ def run(dry_run: bool = False) -> int:
     state["last_check"] = now.isoformat()
     save_state(state)
 
-    # --- 4. Dead man's switch ---------------------------------------------- #
+    # --- 5. Dead man's switch ---------------------------------------------- #
     # Si CE script cesse de tourner (machine éteinte, box HS, cron cassé),
     # Healthchecks.io vous alertera de son côté. C'est la sécurité qui manque
     # à toute surveillance reposant uniquement sur le cloud du fabricant.
@@ -488,12 +546,12 @@ def run(dry_run: bool = False) -> int:
 
 def main() -> int:
     if "--test" in sys.argv:
-        notify(
+        ok = notify(
             "🔔 Test — surveillance photovoltaïque",
             "Si vous lisez ceci, vos notifications fonctionnent.",
             urgent=False,
         )
-        return 0
+        return 0 if ok else 3
 
     missing = [k for k, v in
                (("APS_APP_ID", APP_ID), ("APS_APP_SECRET", APP_SECRET), ("APS_SID", SID))
@@ -501,6 +559,10 @@ def main() -> int:
     if missing:
         log("Variables manquantes : " + ", ".join(missing), err=True)
         return 2
+
+    if not (NTFY_TOPIC or (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) or SMTP_HOST):
+        log("[!] Aucun canal de notification configuré : les alertes ne partiront "
+            "nulle part. Définissez NTFY_TOPIC, TELEGRAM_* ou SMTP_*.", err=True)
 
     return run(dry_run="--dry-run" in sys.argv)
 
