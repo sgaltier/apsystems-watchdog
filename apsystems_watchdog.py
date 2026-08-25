@@ -48,6 +48,7 @@ Réglages (facultatifs) :
   PV_MIN_POWER_W      Seuil de puissance considéré comme "nul". Défaut 20 W.
   PV_GRACE_MINUTES    Durée de production nulle avant alerte. Défaut 60 min.
   PV_STATE_FILE       Fichier d'état. Défaut ~/.apsystems_watchdog.json
+  PV_LOG_FILE         Fichier de log. Défaut ~/.apsystems_watchdog.log
   HEALTHCHECKS_URL    URL de ping Healthchecks.io (dead man's switch)
 
 Usage :
@@ -93,7 +94,20 @@ GRACE_MINUTES = int(os.getenv("PV_GRACE_MINUTES", "60"))
 MAX_API_FAILURES = int(os.getenv("PV_MAX_API_FAILURES", "3"))
 
 STATE_FILE = Path(os.getenv("PV_STATE_FILE", "~/.apsystems_watchdog.json")).expanduser()
+LOG_FILE = Path(os.getenv("PV_LOG_FILE", "~/.apsystems_watchdog.log")).expanduser()
 HEALTHCHECKS_URL = os.getenv("HEALTHCHECKS_URL", "")
+
+# Notifications (au moins un canal)
+NTFY_TOPIC = os.getenv("NTFY_TOPIC")
+NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = os.getenv("SMTP_PORT", "587")
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "")
+SMTP_TO = os.getenv("SMTP_TO", "")
 
 # Le manuel définit RequestPath comme "the last segment of the path".
 # Certaines implémentations signent le chemin complet. Si vous obtenez
@@ -101,6 +115,23 @@ HEALTHCHECKS_URL = os.getenv("HEALTHCHECKS_URL", "")
 SIGN_FULL_PATH = os.getenv("APS_SIGN_FULL_PATH", "0") == "1"
 
 TIMEOUT = 20
+
+
+# --------------------------------------------------------------------------- #
+# Journalisation
+# --------------------------------------------------------------------------- #
+
+def log(message: str, *, err: bool = False) -> None:
+    """Affiche et journalise `message` en une seule ligne, précédée de la date/heure."""
+    one_liner = " ".join(str(message).split("\n"))
+    line = f"{datetime.now().isoformat(timespec='seconds')} {one_liner}"
+    print(line, file=sys.stderr if err else sys.stdout)
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as exc:
+        print(f"[log] échec d'écriture dans {LOG_FILE} : {exc}", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -211,12 +242,11 @@ def notify(title: str, message: str, urgent: bool = True) -> None:
     """Envoie sur tous les canaux configurés. Un canal en échec n'en bloque pas un autre."""
     sent = False
 
-    topic = os.getenv("NTFY_TOPIC")
-    if topic:
+    if NTFY_TOPIC:
         try:
-            server = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+            server = NTFY_SERVER.rstrip("/")
             _post(
-                f"{server}/{topic}",
+                f"{server}/{NTFY_TOPIC}",
                 message.encode("utf-8"),
                 {
                     "Title": title.encode("utf-8").decode("latin-1", "replace"),
@@ -226,46 +256,43 @@ def notify(title: str, message: str, urgent: bool = True) -> None:
             )
             sent = True
         except Exception as exc:  # noqa: BLE001
-            print(f"[ntfy] échec : {exc}", file=sys.stderr)
+            log(f"[ntfy] échec : {exc}", err=True)
 
-    token, chat = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if token and chat:
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         try:
             body = urllib.parse.urlencode(
-                {"chat_id": chat, "text": f"{title}\n\n{message}"}
+                {"chat_id": TELEGRAM_CHAT_ID, "text": f"{title}\n\n{message}"}
             ).encode()
             _post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 body,
                 {"Content-Type": "application/x-www-form-urlencoded"},
             )
             sent = True
         except Exception as exc:  # noqa: BLE001
-            print(f"[telegram] échec : {exc}", file=sys.stderr)
+            log(f"[telegram] échec : {exc}", err=True)
 
-    if os.getenv("SMTP_HOST"):
+    if SMTP_HOST:
         try:
             import smtplib
             from email.message import EmailMessage
 
             msg = EmailMessage()
             msg["Subject"] = title
-            msg["From"] = os.getenv("SMTP_FROM", os.getenv("SMTP_USER", ""))
-            msg["To"] = os.getenv("SMTP_TO", "")
+            msg["From"] = SMTP_FROM
+            msg["To"] = SMTP_TO
             msg.set_content(message)
-            port = int(os.getenv("SMTP_PORT", "587"))
-            with smtplib.SMTP(os.getenv("SMTP_HOST"), port, timeout=TIMEOUT) as smtp:
+            with smtplib.SMTP(SMTP_HOST, int(SMTP_PORT), timeout=TIMEOUT) as smtp:
                 smtp.starttls()
-                if os.getenv("SMTP_USER"):
-                    smtp.login(os.getenv("SMTP_USER"), os.getenv("SMTP_PASS", ""))
+                if SMTP_USER:
+                    smtp.login(SMTP_USER, SMTP_PASS or "")
                 smtp.send_message(msg)
             sent = True
         except Exception as exc:  # noqa: BLE001
-            print(f"[smtp] échec : {exc}", file=sys.stderr)
+            log(f"[smtp] échec : {exc}", err=True)
 
     if not sent:
-        print(f"[!] AUCUN canal de notification n'a fonctionné : {title} — {message}",
-              file=sys.stderr)
+        log(f"[!] AUCUN canal de notification n'a fonctionné : {title} — {message}", err=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -355,7 +382,7 @@ def run(dry_run: bool = False) -> int:
     except Exception as exc:  # noqa: BLE001
         fails = state.get("api_failures", 0) + 1
         state["api_failures"] = fails
-        print(f"[api] échec {fails}/{MAX_API_FAILURES} : {exc}", file=sys.stderr)
+        log(f"[api] échec {fails}/{MAX_API_FAILURES} : {exc}", err=True)
         if fails == MAX_API_FAILURES and not dry_run:
             notify(
                 "⚠️ Surveillance PV : API APsystems injoignable",
@@ -366,11 +393,14 @@ def run(dry_run: bool = False) -> int:
         save_state(state)
         return 1
 
-    print(f"Soleil : {elevation:.1f}°  |  Voyant : {snap['light']} "
-          f"({LIGHT_LABELS.get(snap['light'], '?')})  |  "
-          f"Aujourd'hui : {snap['today_kwh']} kWh")
-    for eid, (power, ts) in snap["per_ecu"].items():
-        print(f"  ECU {eid} : {power} W à {ts}")
+    ecu_details = ", ".join(
+        f"{eid} = {power} W à {ts}" for eid, (power, ts) in snap["per_ecu"].items()
+    )
+    summary = (
+        f"Soleil : {elevation:.1f}°  |  Voyant : {snap['light']} "
+        f"({LIGHT_LABELS.get(snap['light'], '?')})  |  "
+        f"Aujourd'hui : {snap['today_kwh']} kWh  |  ECUs : {ecu_details}"
+    )
 
     problems: list[str] = []
 
@@ -392,7 +422,7 @@ def run(dry_run: bool = False) -> int:
             state["zero_since"] = now.isoformat()
             first_seen = state["zero_since"]
         elapsed = now - datetime.fromisoformat(first_seen)
-        print(f"  -> production nulle depuis {int(elapsed.total_seconds() // 60)} min")
+        log(f"  -> production nulle depuis {int(elapsed.total_seconds() // 60)} min")
         if elapsed >= timedelta(minutes=GRACE_MINUTES):
             noms = ", ".join(zero_ecus)
             problems.append(
@@ -419,7 +449,7 @@ def run(dry_run: bool = False) -> int:
             notify("🔴 Alerte photovoltaïque", message)
         state["alerting"] = True
         state["alert_since"] = now.isoformat()
-        print("ALERTE ENVOYÉE\n" + message)
+        log(summary + " | ALERTE ENVOYÉE " + message)
 
     elif not problems and was_alerting:
         since = state.get("alert_since", "?")
@@ -433,12 +463,12 @@ def run(dry_run: bool = False) -> int:
             )
         state["alerting"] = False
         state.pop("alert_since", None)
-        print("RETOUR À LA NORMALE")
+        log(summary + " | RETOUR À LA NORMALE")
 
     elif problems:
-        print("Problème toujours présent — pas de nouvelle notification (anti-spam).")
+        log(summary + " | Problème toujours présent — pas de nouvelle notification (anti-spam).")
     else:
-        print("Tout va bien.")
+        log(summary + " | Tout va bien.")
 
     state["last_check"] = now.isoformat()
     save_state(state)
@@ -451,7 +481,7 @@ def run(dry_run: bool = False) -> int:
         try:
             urllib.request.urlopen(HEALTHCHECKS_URL, timeout=10).read()
         except Exception as exc:  # noqa: BLE001
-            print(f"[healthchecks] ping échoué : {exc}", file=sys.stderr)
+            log(f"[healthchecks] ping échoué : {exc}", err=True)
 
     return 0
 
@@ -469,7 +499,7 @@ def main() -> int:
                (("APS_APP_ID", APP_ID), ("APS_APP_SECRET", APP_SECRET), ("APS_SID", SID))
                if not v]
     if missing:
-        print("Variables manquantes : " + ", ".join(missing), file=sys.stderr)
+        log("Variables manquantes : " + ", ".join(missing), err=True)
         return 2
 
     return run(dry_run="--dry-run" in sys.argv)
