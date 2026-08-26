@@ -1,0 +1,151 @@
+# Surveillance photovoltaïque APsystems — installation sur Synology DS925+
+
+Conteneur Docker qui interroge l'OpenAPI APsystems toutes les 30 minutes entre
+7h00 et 22h00, et vous notifie si la production s'arrête (disjoncteur qui a
+sauté, ECU hors ligne, onduleur en alarme).
+
+---
+
+## Prérequis
+
+- DSM 7.2 ou supérieur
+- Le paquet **Container Manager** installé (Centre de paquets)
+- Vos identifiants **OpenAPI APsystems** (`App Id`, `App Secret`, `sid`), à 
+  demander directeemnt sur le site web APsystems.
+  **Faites cette démarche en premier** : l'accès n'est pas automatique et peut
+  être facturé.
+
+---
+
+## Étape 1 — Déposer les fichiers sur le NAS
+
+Container Manager crée un dossier partagé `docker` à son installation.
+Via **File Station**, créez le dossier `docker/pv-watchdog` et déposez-y :
+
+```
+/volume1/docker/pv-watchdog/
+├── Dockerfile
+├── docker-compose.yml
+├── entrypoint.sh
+├── apsystems_watchdog.py
+└── config.env          <- à créer à partir de config.env.example
+```
+
+## Étape 2 — Configurer
+
+Renommez `config.env.example` en `config.env` et remplissez-le (éditable
+directement dans File Station : clic droit → Ouvrir avec l'éditeur de texte).
+
+Au minimum :
+
+```
+APS_APP_ID=votre_app_id
+APS_APP_SECRET=votre_secret
+APS_SID=votre_sid
+NTFY_TOPIC=pv-garage-xxxxxxxx
+```
+
+Pour le sujet ntfy, prenez quelque chose d'imprévisible (il est public par
+construction) et abonnez-y l'application ntfy sur votre téléphone.
+
+> **Attention à la syntaxe** : dans un `env_file`, on écrit `CLE=valeur`.
+> Pas de `export`, pas de guillemets, pas d'espace autour du `=`.
+> Une valeur entre guillemets serait lue *avec* les guillemets.
+
+## Étape 3 — Créer le projet dans Container Manager
+
+1. Ouvrez **Container Manager** → onglet **Projet** → **Créer**
+2. Nom du projet : `pv-watchdog`
+3. Chemin : `/volume1/docker/pv-watchdog`
+4. Source : **Utiliser le fichier docker-compose.yml existant**
+5. Cliquez sur **Suivant** puis **Terminé**
+
+DSM construit l'image (une à deux minutes la première fois) et démarre le
+conteneur.
+
+## Étape 4 — Vérifier
+
+Dans Container Manager → Projet → `pv-watchdog` → onglet **Journal**, vous
+devez voir l'en-tête de démarrage, puis une notification de test arriver sur
+votre téléphone dans la foulée.
+
+Ensuite, à chaque exécution :
+
+```
+----- [2026-08-25 14:30:02] -----
+Soleil : 47.3°  |  Voyant : 1 (Vert — fonctionnement normal)  |  Aujourd'hui : 12.4 kWh
+  ECU 203000001234 : 2840.0 W à 14:29
+Tout va bien.
+```
+
+Une fois validé, passez `PV_TEST_ON_START` à `0` dans `docker-compose.yml`
+pour ne plus recevoir de notification à chaque redémarrage du NAS.
+
+---
+
+## Réglages courants
+
+Tout se modifie dans `docker-compose.yml` (section `environment`), puis
+**Projet → Action → Reconstruire** :
+
+| Variable              | Défaut       | Rôle                                    |
+|-----------------------|--------------|-----------------------------------------|
+| `PV_START_TIME`       | `07:00`      | Première exécution de la journée        |
+| `PV_END_TIME`         | `22:00`      | Dernière exécution                      |
+| `PV_INTERVAL_MINUTES` | `30`         | Cadence                                 |
+| `TZ`                  | Europe/Paris | Fuseau (gère l'heure d'été/hiver)       |
+
+Et dans `config.env` :
+
+| Variable            | Défaut | Rôle                                          |
+|---------------------|--------|-----------------------------------------------|
+| `PV_MIN_ELEVATION`  | `15`   | Hauteur du soleil au-delà de laquelle on attend de la production. **Descendez à 10 en hiver** : à Lyon le soleil culmine vers 20° au solstice. |
+| `PV_GRACE_MINUTES`  | `60`   | Durée de production nulle avant d'alerter     |
+| `PV_MIN_POWER_W`    | `20`   | Seuil sous lequel on considère la production nulle |
+
+---
+
+## Le point le plus important : le dead man's switch
+
+Ce conteneur surveille vos panneaux. **Mais qui surveille le conteneur ?**
+
+Si le NAS s'éteint, si la fibre tombe, si le projet Docker plante après une
+mise à jour DSM — le conteneur se tait, et un silence ressemble exactement à
+« tout va bien ». C'est précisément le mode d'échec qui vous a coûté deux
+semaines de production.
+
+Solution, gratuite et en trois minutes :
+
+1. Créez un compte sur **healthchecks.io**
+2. Nouveau check, période **30 minutes**, délai de grâce **90 minutes**
+3. Copiez l'URL de ping dans `config.env` :
+   `HEALTHCHECKS_URL=https://hc-ping.com/xxxxxxxx-xxxx-xxxx`
+
+Le script pinge cette URL à chaque exécution réussie. Si les pings s'arrêtent,
+healthchecks.io vous envoie un e-mail. Vous êtes alors prévenu d'une panne de
+votre surveillance, et pas seulement d'une panne de vos panneaux.
+
+---
+
+## Dépannage
+
+| Symptôme dans le journal | Cause probable |
+|---|---|
+| `OpenAPI code 3002 (Signature invalide)` | Ajoutez `APS_SIGN_FULL_PATH=1` dans `config.env`. Le manuel définit le champ à signer comme « le dernier segment du chemin », ce qui est ambigu — ce drapeau bascule sur le chemin complet. |
+| `OpenAPI code 2002 / 2004` | Compte OpenAPI non autorisé sur cette catégorie de données. À voir avec APsystems. |
+| `OpenAPI code 2005 / 7001` | Quota d'appels dépassé. Augmentez `PV_INTERVAL_MINUTES` à 60. |
+| `OpenAPI code 1001 (Aucune donnée)` | `APS_SID` incorrect, ou l'ECU n'a jamais remonté de données. |
+| `[!] AUCUN canal de notification n'a fonctionné` | `config.env` vide, mal orthographié, ou syntaxe avec guillemets/espaces. |
+| Alertes en pleine nuit | `TZ` mal pris en compte. Vérifiez la ligne « il est HH:MM » au démarrage du journal. |
+| Fausses alertes en hiver | Baissez `PV_MIN_ELEVATION` à 10 et montez `PV_GRACE_MINUTES` à 90. |
+
+Pour tester la chaîne de notification sans attendre :
+**Container Manager → Conteneur → pv-watchdog → Terminal → Créer**, puis :
+
+```
+python3 /app/apsystems_watchdog.py --test
+python3 /app/apsystems_watchdog.py --dry-run
+```
+
+`--dry-run` affiche l'état réel de l'installation sans envoyer d'alerte : c'est
+le meilleur moyen de vérifier que vos identifiants API fonctionnent.

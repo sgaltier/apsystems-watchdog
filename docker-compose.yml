@@ -1,0 +1,41 @@
+services:
+  apsystems-watchdog:
+    build: .
+    image: apsystems-watchdog:latest
+    container_name: apsystems-watchdog
+
+    # Redémarre automatiquement après un reboot du NAS ou une mise à jour DSM.
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+    env_file:
+      - ./config.env
+
+    environment:
+      TZ: Europe/Paris
+      PV_START_TIME: "07:00"
+      PV_END_TIME: "22:00"
+      PV_INTERVAL_MINUTES: "30"
+      PV_STATE_FILE: /data/state.json
+      PV_TEST_ON_START: "1"     # passez à 0 une fois la configuration validée
+
+    volumes:
+      # Conserve l'état (anti-spam, "production nulle depuis...") entre les
+      # redémarrages. Sans ce volume, chaque reboot du NAS reposterait une
+      # alerte déjà envoyée.
+      - pv-data:/data
+
+    # Le conteneur ne fait que quelques requêtes HTTPS par heure : on le bride
+    # pour qu'il ne puisse jamais gêner les autres services du NAS.
+    mem_limit: 128m
+    cpu_shares: 256
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  pv-data:

@@ -158,8 +158,8 @@ GRACE_MINUTES = int(os.getenv("PV_GRACE_MINUTES", "60"))
 MAX_API_FAILURES = int(os.getenv("PV_MAX_API_FAILURES", "3"))
 MAX_DATA_AGE_MINUTES = int(os.getenv("PV_MAX_DATA_AGE_MINUTES", "20"))
 
-STATE_FILE = Path(os.getenv("PV_STATE_FILE", "~/.apsystems_watchdog.json")).expanduser()
-LOG_FILE = Path(os.getenv("PV_LOG_FILE", "~/.apsystems_watchdog.log")).expanduser()
+STATE_FILE = Path(os.getenv("PV_STATE_FILE", "./apsystems_watchdog.json")).expanduser()
+LOG_FILE = Path(os.getenv("PV_LOG_FILE", "./apsystems_watchdog.log")).expanduser()
 HEALTHCHECKS_URL = os.getenv("HEALTHCHECKS_URL", "")
 
 # Notifications (au moins un canal)
