@@ -16,7 +16,9 @@ Détecte :
      quand l'ECU ne remonte plus rien. C'est ce cas -- et non une puissance
      nulle -- qui se produit réellement quand le disjoncteur saute ou que
      l'installation est débranchée. Sans ce contrôle de fraîcheur, la panne est
-     totalement invisible.
+     totalement invisible. Même chose pour un ECU muet depuis minuit : l'API
+     répond alors "aucune donnée" (code 1001), ce qui est normal avant le lever
+     du soleil mais anormal une fois celui-ci haut.
   4. L'API elle-même injoignable N fois de suite
 
 Envoie une alerte (ntfy / Telegram / e-mail SMTP) une seule fois par incident,
@@ -242,7 +244,7 @@ def api_get(path: str, params: dict | None = None) -> dict:
 
     code = int(payload.get("code", -1))
     if code != 0:
-        raise RuntimeError(f"OpenAPI code {code} sur {path} ({CODES.get(code, '?')})")
+        raise ApiError(code, path)
     return payload.get("data")
 
 
@@ -260,6 +262,16 @@ CODES = {
     7001: "Limite d'accès dépassée",
     7002: "Trop de requêtes",
 }
+
+NO_DATA_CODE = 1001
+
+
+class ApiError(RuntimeError):
+    """Erreur applicative de l'OpenAPI (champ « code » non nul)."""
+
+    def __init__(self, code: int, path: str):
+        super().__init__(f"OpenAPI code {code} sur {path} ({CODES.get(code, '?')})")
+        self.code = code
 
 
 # --------------------------------------------------------------------------- #
@@ -395,22 +407,33 @@ LIGHT_LABELS = {
 }
 
 
-def latest_power_w(sid: str, eid: str, day: str) -> tuple[float, str]:
-    """Dernière puissance connue (W) et heure, via la télémétrie 'minutely' de l'ECU."""
-    data = api_get(
-        f"/user/api/v2/systems/{sid}/devices/ecu/energy/{eid}",
-        {"energy_level": "minutely", "date_range": day},
-    )
+def latest_power_w(sid: str, eid: str, day: str) -> tuple[float | None, str | None]:
+    """Dernière puissance connue (W) et heure, via la télémétrie 'minutely' de l'ECU.
+
+    Retourne (None, None) tant que l'API n'a aucun point pour `day` : c'est le
+    cas normal chaque matin avant le réveil de l'ECU (elle répond alors code
+    1001), mais aussi le cas d'un ECU resté muet depuis minuit -- il ne faut
+    donc surtout pas le confondre avec une puissance nulle.
+    """
+    try:
+        data = api_get(
+            f"/user/api/v2/systems/{sid}/devices/ecu/energy/{eid}",
+            {"energy_level": "minutely", "date_range": day},
+        )
+    except ApiError as exc:
+        if exc.code == NO_DATA_CODE:
+            return None, None
+        raise
     if not isinstance(data, dict):
-        return 0.0, "?"
+        return None, None
     powers = data.get("power") or []
     times = data.get("time") or []
     if not powers:
-        return 0.0, "?"
+        return None, None
     try:
         return float(powers[-1]), (times[-1] if times else "?")
     except (TypeError, ValueError):
-        return 0.0, "?"
+        return None, None
 
 
 def data_age_minutes(day: str, ts: str) -> float | None:
@@ -447,7 +470,8 @@ def collect() -> dict:
     for eid in ecus:
         try:
             power, ts = latest_power_w(SID, eid, day)
-            per_ecu[eid] = (power, ts, data_age_minutes(day, ts))
+            age = data_age_minutes(day, ts) if ts else None
+            per_ecu[eid] = (power, ts, age)
         except Exception as exc:  # noqa: BLE001
             per_ecu[eid] = (None, f"erreur: {exc}", None)
 
@@ -458,6 +482,30 @@ def collect() -> dict:
         "today_kwh": summary.get("today"),
         "per_ecu": per_ecu,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Mise en forme
+# --------------------------------------------------------------------------- #
+
+NO_DATA_TEXT = "aucune donnée depuis minuit"
+
+
+def describe_ecu(eid: str, power, ts, age) -> str:
+    """Ligne lisible pour un ECU : mesure, absence de données ou erreur."""
+    if ts is None:
+        return f"{eid} = {NO_DATA_TEXT}"
+    if power is None:
+        return f"{eid} = {ts}"
+    return (f"{eid} = {power} W à {ts}"
+            + (f" (il y a {age:.0f} min)" if age is not None else ""))
+
+
+def describe_power(per_ecu: dict) -> str:
+    return ", ".join(
+        f"{eid} = " + (f"{power} W" if power is not None else NO_DATA_TEXT)
+        for eid, (power, _, _) in per_ecu.items()
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -488,14 +536,15 @@ def run(dry_run: bool = False) -> int:
         return 1
 
     ecu_details = ", ".join(
-        f"{eid} = {power} W à {ts}"
-        + (f" (il y a {age:.0f} min)" if age is not None else "")
+        describe_ecu(eid, power, ts, age)
         for eid, (power, ts, age) in snap["per_ecu"].items()
     )
+    today_kwh = snap["today_kwh"]
+    today_text = f"{today_kwh} kWh" if today_kwh is not None else "pas encore de relevé"
     summary = (
         f"Soleil : {elevation:.1f}°  |  Voyant : {snap['light']} "
         f"({LIGHT_LABELS.get(snap['light'], '?')})  |  "
-        f"Aujourd'hui : {snap['today_kwh']} kWh  |  ECUs : {ecu_details}"
+        f"Aujourd'hui : {today_text}  |  ECUs : {ecu_details}"
     )
 
     problems: list[str] = []
@@ -536,10 +585,16 @@ def run(dry_run: bool = False) -> int:
         (eid, age) for eid, (_, _, age) in snap["per_ecu"].items()
         if age is not None and age > MAX_DATA_AGE_MINUTES
     ]
+    # Un ECU muet depuis minuit ne produit aucun point du tout : l'API répond
+    # "aucune donnée" et non un point périmé. Sans ce cas, une panne survenue de
+    # nuit resterait invisible toute la journée suivante.
+    silent_ecus = [eid for eid, (_, ts, _) in snap["per_ecu"].items() if ts is None]
 
-    if elevation >= MIN_ELEVATION and stale_ecus:
-        noms = ", ".join(f"{eid} (dernier point il y a {age:.0f} min)"
-                         for eid, age in stale_ecus)
+    if elevation >= MIN_ELEVATION and (stale_ecus or silent_ecus):
+        noms = ", ".join(
+            [f"{eid} (dernier point il y a {age:.0f} min)" for eid, age in stale_ecus]
+            + [f"{eid} (aucun point depuis minuit)" for eid in silent_ecus]
+        )
         problems.append(
             f"Aucune donnée fraîche depuis plus de {MAX_DATA_AGE_MINUTES} min "
             f"sur : {noms}. L'ECU ne remonte plus rien alors que le soleil est "
@@ -552,9 +607,8 @@ def run(dry_run: bool = False) -> int:
     if problems and not was_alerting:
         message = (
             "\n".join(f"• {p}" for p in problems)
-            + f"\n\nProduction du jour : {snap['today_kwh']} kWh"
-            + f"\nPuissance instantanée : "
-            + ", ".join(f"{eid} = {p} W" for eid, (p, _, _) in snap["per_ecu"].items())
+            + f"\n\nProduction du jour : {today_text}"
+            + f"\nPuissance instantanée : " + describe_power(snap["per_ecu"])
             + "\n\n👉 Vérifiez les disjoncteurs PV dans le garage, "
               "puis l'alimentation et le réseau de l'ECU."
         )
@@ -570,7 +624,7 @@ def run(dry_run: bool = False) -> int:
             notify(
                 "✅ Photovoltaïque : retour à la normale",
                 f"La production a repris.\nPuissance : "
-                + ", ".join(f"{eid} = {p} W" for eid, (p, _, _) in snap["per_ecu"].items())
+                + describe_power(snap["per_ecu"])
                 + f"\nIncident ouvert depuis : {since}",
                 urgent=False,
             )
