@@ -8,7 +8,7 @@ sauté, ECU hors ligne, onduleur en alarme).
 
 ## Prérequis
 
-- DSM 7.2 ou supérieur
+- NAS Synology avec DSM 7.2 ou supérieur
 - Le paquet **Container Manager** installé (Centre de paquets)
 - Vos identifiants **OpenAPI APsystems** (`App Id`, `App Secret`, `sid`), à 
   demander directeemnt sur le site web APsystems.
@@ -149,3 +149,20 @@ python3 /app/apsystems_watchdog.py --dry-run
 
 `--dry-run` affiche l'état réel de l'installation sans envoyer d'alerte : c'est
 le meilleur moyen de vérifier que vos identifiants API fonctionnent.
+
+---
+
+## Licence
+
+Ce projet est distribué sous licence **GNU Affero General Public License v3.0
+ou ultérieure** (AGPL-3.0-or-later). Le texte complet se trouve dans le fichier
+[LICENSE](LICENSE).
+
+Concrètement, si vous forkez ou modifiez ce code :
+
+- vous devez publier votre version modifiée sous la même licence AGPL ;
+- cela vaut aussi si vous ne distribuez pas le programme mais le proposez
+  comme service accessible par le réseau (clause réseau de l'article 13) ;
+- vous devez conserver les mentions de copyright et indiquer vos modifications.
+
+Copyright (C) 2026 Sébastien Galtier.

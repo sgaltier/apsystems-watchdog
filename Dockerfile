@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
 FROM python:3.12-slim
 
 # tzdata : indispensable pour que TZ=Europe/Paris soit interprété (heure d'été/hiver)
