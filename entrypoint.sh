@@ -57,7 +57,6 @@ while true; do
     now_min=$(( $(date +%-H) * 60 + $(date +%-M) ))
 
     if [ "$now_min" -ge "$START_MIN" ] && [ "$now_min" -le "$END_MIN" ]; then
-        echo "----- [$(date '+%F %T')] -----"
         # On ne veut jamais que la boucle meure : une erreur du script ne doit
         # pas arrêter la surveillance des heures suivantes.
         python3 -u /app/apsystems_watchdog.py || \

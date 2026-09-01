@@ -72,10 +72,7 @@ votre téléphone dans la foulée.
 Ensuite, à chaque exécution :
 
 ```
------ [2026-08-25 14:30:02] -----
-Soleil : 47.3°  |  Voyant : 1 (Vert — fonctionnement normal)  |  Aujourd'hui : 12.4 kWh
-  ECU 203000001234 : 2840.0 W à 14:29
-Tout va bien.
+2026-09-01T20:08:34 Soleil : 1.3° | Voyant : 1 (Vert — fonctionnement normal) | Aujourd'hui : 34.71 kWh | ECUs : 215000042894 = 194.0 W à 20:00 (il y a 9 min) | Tout va bien.
 ```
 
 Une fois validé, passez `PV_TEST_ON_START` à `0` dans `docker-compose.yml`
