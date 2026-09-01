@@ -19,6 +19,7 @@ services:
       PV_END_TIME: "22:00"
       PV_INTERVAL_MINUTES: "30"
       PV_STATE_FILE: /data/state.json
+      PV_LOG_FILE: /data/apsystems_watchdog.log
       PV_TEST_ON_START: "1"     # passez à 0 une fois la configuration validée
 
     volumes:
@@ -32,11 +33,19 @@ services:
     mem_limit: 128m
     cpu_shares: 256
 
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "3"
+    # Pas de section « logging: » ici, volontairement.
+    #
+    # DSM utilise un pilote de journalisation maison, « db », et c'est cette
+    # base que lit l'onglet « Journal » de Container Manager. Imposer
+    # driver: json-file (le défaut de Docker en amont) fait écrire le conteneur
+    # dans un fichier que l'interface DSM ne consulte pas : l'onglet reste
+    # désespérément vide alors que la sortie standard est bien produite.
+    # En laissant DSM choisir, le journal redevient lisible depuis l'interface.
+    #
+    # Sur un Docker standard (Linux, portage ailleurs), l'absence de cette
+    # section retombe sur json-file sans rotation. Le conteneur écrit environ
+    # 5 Ko par jour : cela reste négligeable, et le fichier de log applicatif
+    # (PV_LOG_FILE) garde de toute façon l'historique complet.
 
 volumes:
   pv-data:

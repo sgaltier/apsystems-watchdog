@@ -210,13 +210,18 @@ def log(message: str, *, err: bool = False) -> None:
     """Affiche et journalise `message` en une seule ligne, précédée de la date/heure."""
     one_liner = " ".join(str(message).split("\n"))
     line = f"{datetime.now().isoformat(timespec='seconds')} {one_liner}"
-    print(line, file=sys.stderr if err else sys.stdout)
+    # flush=True : un stdout redirigé vers un pipe (cas du conteneur) est
+    # bufferisé par blocs. Sans vidage explicite, le journal du conteneur reste
+    # vide tant que le buffer n'est pas plein ; PYTHONUNBUFFERED ne peut pas
+    # être supposé présent selon la façon dont l'image est lancée.
+    print(line, file=sys.stderr if err else sys.stdout, flush=True)
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError as exc:
-        print(f"[log] échec d'écriture dans {LOG_FILE} : {exc}", file=sys.stderr)
+        print(f"[log] échec d'écriture dans {LOG_FILE} : {exc}",
+              file=sys.stderr, flush=True)
 
 
 # --------------------------------------------------------------------------- #

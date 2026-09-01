@@ -138,6 +138,7 @@ votre surveillance, et pas seulement d'une panne de vos panneaux.
 | `[!] AUCUN canal de notification n'a fonctionné` | `config.env` vide, mal orthographié, ou syntaxe avec guillemets/espaces. |
 | Alertes en pleine nuit | `TZ` mal pris en compte. Vérifiez la ligne « il est HH:MM » au démarrage du journal. |
 | Fausses alertes en hiver | Baissez `PV_MIN_ELEVATION` à 10 et montez `PV_GRACE_MINUTES` à 90. |
+| Onglet **Journal** vide alors que le conteneur tourne | Une section `logging:` dans `docker-compose.yml` détourne la sortie vers un pilote que DSM ne lit pas. Retirez-la, puis **supprimez et recréez** le conteneur : le pilote de journalisation est figé à sa création, un simple redémarrage ne suffit pas. |
 
 Pour tester la chaîne de notification sans attendre :
 **Container Manager → Conteneur → pv-watchdog → Terminal → Créer**, puis :

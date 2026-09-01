@@ -9,7 +9,8 @@ RUN apt-get update \
 
 ENV PYTHONUNBUFFERED=1 \
     TZ=Europe/Paris \
-    PV_STATE_FILE=/data/state.json
+    PV_STATE_FILE=/data/state.json \
+    PV_LOG_FILE=/data/apsystems_watchdog.log
 
 WORKDIR /app
 COPY apsystems_watchdog.py /app/

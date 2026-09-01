@@ -12,6 +12,12 @@
 
 set -eu
 
+# Tout part sur la sortie standard du PID 1 : c'est elle, et elle seule, que
+# Container Manager affiche dans l'onglet « Log ». Les messages d'erreur du
+# script (qui vont sur stderr) y sont donc visibles aussi, sans avoir à ouvrir
+# un terminal dans le conteneur pour lire le fichier de log.
+exec 2>&1
+
 START_TIME="${PV_START_TIME:-07:00}"   # première exécution de la journée
 END_TIME="${PV_END_TIME:-22:00}"       # dernière exécution de la journée
 INTERVAL="${PV_INTERVAL_MINUTES:-30}"  # cadence, en minutes
@@ -42,7 +48,7 @@ echo "=========================================================="
 # chaîne d'alerte fonctionne, plutôt que de le découvrir le jour de la panne.
 if [ "${PV_TEST_ON_START:-1}" = "1" ]; then
     echo "[$(date '+%F %T')] Envoi d'une notification de test..."
-    python3 /app/apsystems_watchdog.py --test || \
+    python3 -u /app/apsystems_watchdog.py --test || \
         echo "[!] Le test de notification a échoué — vérifiez la configuration."
 fi
 
@@ -54,7 +60,7 @@ while true; do
         echo "----- [$(date '+%F %T')] -----"
         # On ne veut jamais que la boucle meure : une erreur du script ne doit
         # pas arrêter la surveillance des heures suivantes.
-        python3 /app/apsystems_watchdog.py || \
+        python3 -u /app/apsystems_watchdog.py || \
             echo "[!] Exécution terminée en erreur (code $?)"
     fi
 
