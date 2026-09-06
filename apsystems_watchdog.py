@@ -28,7 +28,11 @@ Surveillance d'une installation photovoltaïque APsystems via l'OpenAPI officiel
 Détecte :
   1. Le voyant système "light" != 1 (2 = alarme onduleur, 3 = ECU hors ligne,
      4 = aucune donnée remontée). Attention : ce voyant est mis à jour très
-     paresseusement par le cloud APsystems, il ne suffit pas à lui seul.
+     paresseusement par le cloud APsystems, il ne suffit pas à lui seul. Le
+     jaune (2) est de surcroît sujet aux faux positifs -- un micro-onduleur qui
+     se met brièvement en alarme, typiquement en surtension réseau pendant la
+     montée en production du matin -- : tant que la production reste normale,
+     il faut deux relevés jaunes consécutifs pour déclencher l'alerte.
   2. Une puissance instantanée nulle alors que le soleil est suffisamment haut.
   3. Des données figées : l'API continue de renvoyer le DERNIER point connu même
      quand l'ECU ne remonte plus rien. C'est ce cas -- et non une puissance
@@ -429,6 +433,10 @@ LIGHT_LABELS = {
     4: "Gris — aucune donnée remontée par l'ECU",
 }
 
+# Nombre de relevés jaunes consécutifs exigés avant d'alerter quand rien d'autre
+# ne cloche. Le rouge et le gris, eux, alertent dès le premier relevé.
+LIGHT2_CONFIRMATIONS = 2
+
 
 def latest_power_w(sid: str, eid: str, day: str) -> tuple[float | None, str | None]:
     """Dernière puissance connue (W) et heure, via la télémétrie 'minutely' de l'ECU.
@@ -572,11 +580,10 @@ def run(dry_run: bool = False) -> int:
 
     problems: list[str] = []
 
-    # --- 1. Voyant système -------------------------------------------------- #
+    # --- 1. Voyant système rouge ou gris ------------------------------------ #
+    # Le jaune est traité plus bas : il exige une confirmation.
     if snap["light"] in (3, 4):
         problems.append(f"Voyant système : {LIGHT_LABELS[snap['light']]}.")
-    elif snap["light"] == 2:
-        problems.append(f"Voyant système : {LIGHT_LABELS[2]}.")
 
     # --- 2. Production nulle en plein soleil -------------------------------- #
     zero_ecus = [
@@ -624,7 +631,23 @@ def run(dry_run: bool = False) -> int:
             f"à {elevation:.0f}° au-dessus de l'horizon."
         )
 
-    # --- 4. Notification (une seule par incident, + retour à la normale) ---- #
+    # --- 4. Voyant jaune : confirmation exigée si la production est normale -- #
+    # Un micro-onduleur qui se met brièvement en alarme (surtension réseau au
+    # moment où la production monte, le matin) fait clignoter le voyant jaune
+    # sans rien coûter en énergie. Tant que les contrôles ci-dessus ne relèvent
+    # rien, on attend un second relevé jaune consécutif avant d'alerter.
+    if snap["light"] == 2:
+        streak = state.get("light2_streak", 0) + 1
+        state["light2_streak"] = streak
+        if problems or streak >= LIGHT2_CONFIRMATIONS:
+            problems.append(f"Voyant système : {LIGHT_LABELS[2]}.")
+        else:
+            log(f"  -> voyant jaune ({streak}/{LIGHT2_CONFIRMATIONS}), production "
+                f"normale : confirmation attendue au prochain relevé")
+    else:
+        state.pop("light2_streak", None)
+
+    # --- 5. Notification (une seule par incident, + retour à la normale) ---- #
     was_alerting = state.get("alerting", False)
 
     if problems and not was_alerting:
@@ -663,7 +686,7 @@ def run(dry_run: bool = False) -> int:
     state["last_check"] = now.isoformat()
     save_state(state)
 
-    # --- 5. Dead man's switch ---------------------------------------------- #
+    # --- 6. Dead man's switch ---------------------------------------------- #
     # Si CE script cesse de tourner (machine éteinte, box HS, cron cassé),
     # Healthchecks.io vous alertera de son côté. C'est la sécurité qui manque
     # à toute surveillance reposant uniquement sur le cloud du fabricant.
