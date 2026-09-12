@@ -99,6 +99,27 @@ Et dans `config.env` :
 | `PV_MIN_ELEVATION`  | `15`   | Hauteur du soleil au-delà de laquelle on attend de la production. **Descendez à 10 en hiver** : à Lyon le soleil culmine vers 20° au solstice. |
 | `PV_GRACE_MINUTES`  | `60`   | Durée de production nulle avant d'alerter     |
 | `PV_MIN_POWER_W`    | `20`   | Seuil sous lequel on considère la production nulle |
+| `PV_QUOTA_PROBE_HOUR` | `12` | Heure de l'unique essai quotidien quand le quota d'appels est épuisé |
+
+---
+
+## Quand le quota d'appels APsystems est épuisé
+
+L'OpenAPI est facturée à l'usage et plafonnée : une fois le quota consommé,
+elle répond `code 2005` à *tous* les appels, et plus rien n'est observable.
+Continuer à interroger toutes les 30 minutes ne ferait qu'entamer le quota du
+lendemain et remplir le journal d'erreurs.
+
+Le script :
+
+1. vous notifie **une seule fois** (ntfy / Telegram / e-mail) que la
+   surveillance est suspendue faute de quota ;
+2. se met en veille et ne retente **qu'un appel par jour, à midi** ;
+3. vous notifie dès que l'appel repasse, et reprend sa cadence normale.
+
+Le ping Healthchecks.io continue pendant la veille : le script est bien vivant,
+c'est l'API qui ne répond plus — le dead man's switch ne doit pas se déclencher
+pour ça.
 
 ---
 
@@ -130,7 +151,8 @@ votre surveillance, et pas seulement d'une panne de vos panneaux.
 |---|---|
 | `OpenAPI code 3002 (Signature invalide)` | Ajoutez `APS_SIGN_FULL_PATH=1` dans `config.env`. Le manuel définit le champ à signer comme « le dernier segment du chemin », ce qui est ambigu — ce drapeau bascule sur le chemin complet. |
 | `OpenAPI code 2002 / 2004` | Compte OpenAPI non autorisé sur cette catégorie de données. À voir avec APsystems. |
-| `OpenAPI code 2005 / 7001` | Quota d'appels dépassé. Augmentez `PV_INTERVAL_MINUTES` à 60. |
+| `OpenAPI code 2005 (Quota d'appels dépassé)` | Le script vous notifie une fois, puis se met en veille et ne retente qu'un appel par jour, à midi, jusqu'au renouvellement du quota (voir ci-dessous). Pour éviter que cela se reproduise, augmentez `PV_INTERVAL_MINUTES` à 60. |
+| `OpenAPI code 7001 / 7002` | Limite de débit momentanée. Sans gravité si c'est isolé ; sinon espacez les relevés. |
 | `OpenAPI code 1001 (Aucune donnée)` | `APS_SID` incorrect, ou l'ECU n'a jamais remonté de données. |
 | `[!] AUCUN canal de notification n'a fonctionné` | `config.env` vide, mal orthographié, ou syntaxe avec guillemets/espaces. |
 | Alertes en pleine nuit | `TZ` mal pris en compte. Vérifiez la ligne « il est HH:MM » au démarrage du journal. |

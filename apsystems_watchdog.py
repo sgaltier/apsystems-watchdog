@@ -42,6 +42,10 @@ Détecte :
      répond alors "aucune donnée" (code 1001), ce qui est normal avant le lever
      du soleil mais anormal une fois celui-ci haut.
   4. L'API elle-même injoignable N fois de suite
+  5. Le quota d'appels de l'OpenAPI épuisé (code 2005). Plus rien n'est
+     observable tant qu'il n'est pas renouvelé, et chaque appel supplémentaire
+     est inutile : on prévient une fois, puis on se met en veille et on ne
+     retente plus qu'une fois par jour, à midi, jusqu'au renouvellement.
 
 Envoie une alerte (ntfy / Telegram / e-mail SMTP) une seule fois par incident,
 puis un message de retour à la normale.
@@ -89,6 +93,8 @@ Réglages (facultatifs) :
                       Âge maximal du dernier point de télémétrie avant de
                       considérer que l'ECU ne remonte plus rien. Défaut 20 min
                       (l'ECU publie toutes les ~5 min).
+  PV_QUOTA_PROBE_HOUR Heure locale à laquelle on retente un appel quand le
+                      quota est épuisé. Défaut 12 (midi).
   PV_STATE_FILE       Fichier d'état. Défaut ~/.apsystems_watchdog.json
   PV_LOG_FILE         Fichier de log. Défaut ~/.apsystems_watchdog.log
   HEALTHCHECKS_URL    URL de ping Healthchecks.io (dead man's switch)
@@ -181,6 +187,7 @@ MIN_POWER_W = float(os.getenv("PV_MIN_POWER_W", "20"))
 GRACE_MINUTES = int(os.getenv("PV_GRACE_MINUTES", "60"))
 MAX_API_FAILURES = int(os.getenv("PV_MAX_API_FAILURES", "3"))
 MAX_DATA_AGE_MINUTES = int(os.getenv("PV_MAX_DATA_AGE_MINUTES", "20"))
+QUOTA_PROBE_HOUR = int(os.getenv("PV_QUOTA_PROBE_HOUR", "12"))
 
 STATE_FILE = Path(os.getenv("PV_STATE_FILE", "./apsystems_watchdog.json")).expanduser()
 LOG_FILE = Path(os.getenv("PV_LOG_FILE", "./apsystems_watchdog.log")).expanduser()
@@ -291,6 +298,7 @@ CODES = {
 }
 
 NO_DATA_CODE = 1001
+QUOTA_CODE = 2005
 
 
 class ApiError(RuntimeError):
@@ -503,6 +511,14 @@ def collect() -> dict:
             power, ts = latest_power_w(SID, eid, day)
             age = data_age_minutes(day, ts) if ts else None
             per_ecu[eid] = (power, ts, age)
+        except ApiError as exc:
+            # Un quota épuisé ne concerne pas cet ECU en particulier : les
+            # appels suivants échoueront tous de la même façon. On laisse
+            # remonter pour que run() bascule en veille au lieu de conclure à
+            # une panne de l'installation.
+            if exc.code == QUOTA_CODE:
+                raise
+            per_ecu[eid] = (None, f"erreur: {exc}", None)
         except Exception as exc:  # noqa: BLE001
             per_ecu[eid] = (None, f"erreur: {exc}", None)
 
@@ -540,31 +556,120 @@ def describe_power(per_ecu: dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Dead man's switch
+# --------------------------------------------------------------------------- #
+
+def ping_healthchecks(dry_run: bool) -> None:
+    """Signale à Healthchecks.io que le script tourne toujours.
+
+    Si CE script cesse de tourner (machine éteinte, box HS, cron cassé),
+    Healthchecks.io vous alertera de son côté. C'est la sécurité qui manque à
+    toute surveillance reposant uniquement sur le cloud du fabricant. Il faut
+    donc continuer à pinger même quand on est en veille faute de quota : le
+    script, lui, est bien vivant.
+    """
+    if not HEALTHCHECKS_URL or dry_run:
+        return
+    try:
+        urllib.request.urlopen(HEALTHCHECKS_URL, timeout=10).read()
+    except Exception as exc:  # noqa: BLE001
+        log(f"[healthchecks] ping échoué : {exc}", err=True)
+
+
+# --------------------------------------------------------------------------- #
+# Quota d'appels épuisé
+# --------------------------------------------------------------------------- #
+
+def quota_probe_due(state: dict, today: str) -> bool:
+    """Vrai s'il est l'heure de retenter un appel après un quota épuisé.
+
+    Une seule tentative par journée civile, à partir de PV_QUOTA_PROBE_HOUR :
+    le quota est compté à la journée, insister avant son renouvellement ne
+    ferait que gaspiller les appels du lendemain.
+    """
+    return (datetime.now().hour >= QUOTA_PROBE_HOUR
+            and state.get("quota_probe_day") != today)
+
+
+# --------------------------------------------------------------------------- #
 # Logique d'alerte
 # --------------------------------------------------------------------------- #
+
+def api_failure(state: dict, exc: Exception, dry_run: bool) -> int:
+    """Comptabilise un échec d'appel et alerte au N-ième consécutif."""
+    fails = state.get("api_failures", 0) + 1
+    state["api_failures"] = fails
+    log(f"[api] échec {fails}/{MAX_API_FAILURES} : {exc}", err=True)
+    if fails == MAX_API_FAILURES and not dry_run:
+        notify(
+            "⚠️ Surveillance PV : API APsystems injoignable",
+            f"{fails} échecs consécutifs.\nDernière erreur : {exc}\n\n"
+            "Cela peut venir du cloud APsystems, de votre connexion "
+            "Internet, ou de vos identifiants OpenAPI.",
+        )
+    save_state(state)
+    return 1
+
 
 def run(dry_run: bool = False) -> int:
     state = load_state()
     now = datetime.now(timezone.utc)
+    today = datetime.now().strftime("%Y-%m-%d")
     elevation = solar_elevation(LAT, LON, now)
+
+    # --- 0. Veille pour cause de quota épuisé ------------------------------- #
+    quota_since = state.get("quota_exhausted_since")
+    if quota_since and not quota_probe_due(state, today):
+        log(f"[quota] Quota d'appels épuisé depuis {quota_since} — surveillance "
+            f"en veille, prochain essai à {QUOTA_PROBE_HOUR}h.")
+        ping_healthchecks(dry_run)
+        return 0
+    if quota_since:
+        # Marqué avant l'appel : qu'il réussisse ou non, la tentative du jour
+        # est consommée.
+        state["quota_probe_day"] = today
 
     # --- Appel API, avec tolérance aux pannes passagères -------------------- #
     try:
         snap = collect()
         state["api_failures"] = 0
-    except Exception as exc:  # noqa: BLE001
-        fails = state.get("api_failures", 0) + 1
-        state["api_failures"] = fails
-        log(f"[api] échec {fails}/{MAX_API_FAILURES} : {exc}", err=True)
-        if fails == MAX_API_FAILURES and not dry_run:
+        if state.pop("quota_exhausted_since", None):
+            state.pop("quota_probe_day", None)
+            log("[quota] Quota d'appels renouvelé — reprise de la cadence normale.")
+            if not dry_run:
+                notify(
+                    "✅ Surveillance PV : quota d'appels renouvelé",
+                    f"L'OpenAPI APsystems répond de nouveau.\nQuota épuisé "
+                    f"depuis : {quota_since}\n\nLa surveillance reprend sa "
+                    "cadence normale.",
+                    urgent=False,
+                )
+    except ApiError as exc:
+        if exc.code != QUOTA_CODE:
+            return api_failure(state, exc, dry_run)
+        first = not quota_since
+        state["quota_exhausted_since"] = quota_since or now.isoformat()
+        state["quota_probe_day"] = today
+        # Ce n'est pas une panne réseau : le compteur d'échecs consécutifs ne
+        # doit pas déclencher en plus l'alerte « API injoignable ».
+        state["api_failures"] = 0
+        log(f"[quota] {exc} — surveillance en veille, un seul essai par jour "
+            f"à {QUOTA_PROBE_HOUR}h jusqu'au renouvellement.")
+        if first and not dry_run:
             notify(
-                "⚠️ Surveillance PV : API APsystems injoignable",
-                f"{fails} échecs consécutifs.\nDernière erreur : {exc}\n\n"
-                "Cela peut venir du cloud APsystems, de votre connexion "
-                "Internet, ou de vos identifiants OpenAPI.",
+                "⚠️ Surveillance PV : quota d'appels APsystems épuisé",
+                f"{exc}\n\nAucune donnée n'est plus lisible tant que le quota "
+                "n'est pas renouvelé : la surveillance de l'installation est "
+                f"suspendue.\n\nLe script retentera un appel une fois par jour, "
+                f"à {QUOTA_PROBE_HOUR}h, et vous préviendra dès que l'accès "
+                "sera rétabli.\n\n👉 Pensez à espacer les relevés "
+                "(PV_INTERVAL_MINUTES) si le quota est atteint régulièrement.",
             )
         save_state(state)
-        return 1
+        ping_healthchecks(dry_run)
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        return api_failure(state, exc, dry_run)
 
     ecu_details = ", ".join(
         describe_ecu(eid, power, ts, age)
@@ -687,14 +792,7 @@ def run(dry_run: bool = False) -> int:
     save_state(state)
 
     # --- 6. Dead man's switch ---------------------------------------------- #
-    # Si CE script cesse de tourner (machine éteinte, box HS, cron cassé),
-    # Healthchecks.io vous alertera de son côté. C'est la sécurité qui manque
-    # à toute surveillance reposant uniquement sur le cloud du fabricant.
-    if HEALTHCHECKS_URL and not dry_run:
-        try:
-            urllib.request.urlopen(HEALTHCHECKS_URL, timeout=10).read()
-        except Exception as exc:  # noqa: BLE001
-            log(f"[healthchecks] ping échoué : {exc}", err=True)
+    ping_healthchecks(dry_run)
 
     return 0
 
