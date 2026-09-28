@@ -20,7 +20,7 @@ exec 2>&1
 
 START_TIME="${PV_START_TIME:-07:00}"   # première exécution de la journée
 END_TIME="${PV_END_TIME:-22:00}"       # dernière exécution de la journée
-INTERVAL="${PV_INTERVAL_MINUTES:-30}"  # cadence, en minutes
+INTERVAL="${PV_INTERVAL_MINUTES:-15}"  # cadence de réveil, en minutes
 
 to_minutes() {
     # "07:30" -> 450
@@ -40,7 +40,7 @@ echo "=========================================================="
 echo " Surveillance photovoltaïque APsystems"
 echo " Fuseau      : ${TZ:-UTC}  (il est $(date '+%H:%M'))"
 echo " Plage       : ${START_TIME} -> ${END_TIME}"
-echo " Cadence     : toutes les ${INTERVAL} min"
+echo " Réveil      : toutes les ${INTERVAL} min (relevé API selon le soleil et le budget)"
 echo " État        : ${PV_STATE_FILE:-~/.apsystems_watchdog.json}"
 echo "=========================================================="
 

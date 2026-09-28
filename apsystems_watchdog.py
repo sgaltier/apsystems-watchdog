@@ -43,9 +43,19 @@ Détecte :
      du soleil mais anormal une fois celui-ci haut.
   4. L'API elle-même injoignable N fois de suite
   5. Le quota d'appels de l'OpenAPI épuisé (code 2005). Plus rien n'est
-     observable tant qu'il n'est pas renouvelé, et chaque appel supplémentaire
-     est inutile : on prévient une fois, puis on se met en veille et on ne
-     retente plus qu'une fois par jour, à midi, jusqu'au renouvellement.
+     observable tant qu'il n'est pas renouvelé -- le 1er de chaque mois -- et
+     chaque appel supplémentaire est inutile : on prévient une fois, puis on se
+     met en veille et on ne retente plus qu'une fois par jour, à midi, à partir
+     du 1er du mois suivant.
+
+Économie d'appels (le quota est de 1000 appels par mois) :
+  - aucun appel quand le soleil est sous PV_MIN_ELEVATION : aucune des
+    détections ci-dessus n'a de sens la nuit ;
+  - la production du jour (appel « summary ») n'est lue qu'au moment d'envoyer
+    une alerte ;
+  - l'intervalle entre deux relevés s'adapte à la durée du jour pour répartir
+    PV_MONTHLY_BUDGET sur le mois : ~30 min en hiver, ~1 h en été ;
+  - un compteur mensuel suspend les relevés avant que le quota ne soit atteint.
 
 Envoie une alerte (ntfy / Telegram / e-mail SMTP) une seule fois par incident,
 puis un message de retour à la normale.
@@ -74,8 +84,8 @@ Obligatoires :
   APS_SID             Identifiant de votre système (visible dans EMA)
 
 Localisation (pour calculer la hauteur du soleil) :
-  PV_LAT              Latitude  (défaut 45.75  = Lyon)
-  PV_LON              Longitude (défaut  4.85  = Lyon)
+  PV_LAT              Latitude  (défaut 46.16 = Fillinges)
+  PV_LON              Longitude (défaut  6.34 = Fillinges)
 
 Notifications (au moins une) :
   NTFY_TOPIC          Sujet ntfy.sh, ex. "pv-alerte-xyz123" (le plus simple)
@@ -95,6 +105,10 @@ Réglages (facultatifs) :
                       (l'ECU publie toutes les ~5 min).
   PV_QUOTA_PROBE_HOUR Heure locale à laquelle on retente un appel quand le
                       quota est épuisé. Défaut 12 (midi).
+  PV_MONTHLY_BUDGET   Nombre maximal d'appels API par mois civil. Défaut 950,
+                      pour garder une marge sous le quota de 1000.
+  PV_MIN_INTERVAL_MINUTES
+                      Intervalle minimal entre deux relevés. Défaut 30 min.
   PV_STATE_FILE       Fichier d'état. Défaut ~/.apsystems_watchdog.json
   PV_LOG_FILE         Fichier de log. Défaut ~/.apsystems_watchdog.log
   HEALTHCHECKS_URL    URL de ping Healthchecks.io (dead man's switch)
@@ -104,12 +118,13 @@ Usage :
   python3 apsystems_watchdog.py --test        # teste juste les notifications
   python3 apsystems_watchdog.py --dry-run     # affiche l'état, n'alerte pas
 
-Cron conseillé (toutes les 20 min, de 7h à 21h -- l'API est facturée à l'usage,
-inutile de la solliciter la nuit) :
-  */20 7-21 * * *  /usr/bin/python3 /opt/pv/apsystems_watchdog.py >> /var/log/pv.log 2>&1
+Cron conseillé (réveil toutes les 15 min ; le script décide lui-même s'il est
+temps d'appeler l'API, et ne l'appelle jamais quand le soleil est bas) :
+  */15 6-21 * * *  /usr/bin/python3 /opt/pv/apsystems_watchdog.py >> /var/log/pv.log 2>&1
 """
 
 import base64
+import calendar
 import hashlib
 import hmac
 import json
@@ -179,8 +194,8 @@ APP_ID = os.getenv("APS_APP_ID", "")
 APP_SECRET = os.getenv("APS_APP_SECRET", "")
 SID = os.getenv("APS_SID", "")
 
-LAT = float(os.getenv("PV_LAT", "45.75"))
-LON = float(os.getenv("PV_LON", "4.85"))
+LAT = float(os.getenv("PV_LAT", "46.16"))
+LON = float(os.getenv("PV_LON", "6.34"))
 
 MIN_ELEVATION = float(os.getenv("PV_MIN_ELEVATION", "15"))
 MIN_POWER_W = float(os.getenv("PV_MIN_POWER_W", "20"))
@@ -188,6 +203,8 @@ GRACE_MINUTES = int(os.getenv("PV_GRACE_MINUTES", "60"))
 MAX_API_FAILURES = int(os.getenv("PV_MAX_API_FAILURES", "3"))
 MAX_DATA_AGE_MINUTES = int(os.getenv("PV_MAX_DATA_AGE_MINUTES", "20"))
 QUOTA_PROBE_HOUR = int(os.getenv("PV_QUOTA_PROBE_HOUR", "12"))
+MONTHLY_BUDGET = int(os.getenv("PV_MONTHLY_BUDGET", "950"))
+MIN_INTERVAL_MINUTES = int(os.getenv("PV_MIN_INTERVAL_MINUTES", "30"))
 
 STATE_FILE = Path(os.getenv("PV_STATE_FILE", "./apsystems_watchdog.json")).expanduser()
 LOG_FILE = Path(os.getenv("PV_LOG_FILE", "./apsystems_watchdog.log")).expanduser()
@@ -249,8 +266,15 @@ def _sign(string_to_sign: str) -> str:
     return base64.b64encode(digest).decode("ascii")
 
 
+# Appels émis depuis le dernier save_state(), qui les reporte dans le compteur
+# mensuel. Un appel en échec compte aussi : rien ne garantit que le serveur ne
+# l'a pas décompté du quota.
+api_calls = 0
+
+
 def api_get(path: str, params: dict | None = None) -> dict:
     """Appel GET signé de l'OpenAPI. Lève RuntimeError si code != 0."""
+    global api_calls
     timestamp = str(int(datetime.now(timezone.utc).timestamp() * 1000))
     nonce = uuid.uuid4().hex  # chaîne de 32 caractères, cf. §2.2.1
     method = "GET"
@@ -273,6 +297,7 @@ def api_get(path: str, params: dict | None = None) -> dict:
     req.add_header("X-CA-Signature", _sign(string_to_sign))
 
     ctx = ssl.create_default_context()
+    api_calls += 1
     with urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
 
@@ -426,6 +451,10 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    """Enregistre l'état, après y avoir reporté les appels API de l'exécution."""
+    global api_calls
+    state["calls_count"] = state.get("calls_count", 0) + api_calls
+    api_calls = 0
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
@@ -499,7 +528,6 @@ def data_age_minutes(day: str, ts: str) -> float | None:
 def collect() -> dict:
     """Retourne un instantané de l'installation."""
     details = api_get(f"/user/api/v2/systems/details/{SID}")
-    summary = api_get(f"/user/api/v2/systems/summary/{SID}")
 
     ecus = details.get("ecu") or []
     # Le fuseau renvoyé par l'API sert à déterminer "aujourd'hui" côté installation.
@@ -526,9 +554,24 @@ def collect() -> dict:
         "light": int(details.get("light", 0)),
         "capacity": details.get("capacity"),
         "ecus": ecus,
-        "today_kwh": summary.get("today"),
         "per_ecu": per_ecu,
     }
+
+
+def today_energy_text() -> str:
+    """Production du jour, pour le corps d'une alerte.
+
+    Lue uniquement au moment de notifier : l'appel ne sert qu'à l'affichage et
+    coûterait sinon un appel de plus à chaque relevé. Son échec ne doit pas
+    empêcher l'alerte de partir.
+    """
+    try:
+        data = api_get(f"/user/api/v2/systems/summary/{SID}") or {}
+    except Exception as exc:  # noqa: BLE001
+        log(f"[api] production du jour illisible : {exc}", err=True)
+        return "indisponible"
+    today_kwh = data.get("today")
+    return f"{today_kwh} kWh" if today_kwh is not None else "pas encore de relevé"
 
 
 # --------------------------------------------------------------------------- #
@@ -580,15 +623,59 @@ def ping_healthchecks(dry_run: bool) -> None:
 # Quota d'appels épuisé
 # --------------------------------------------------------------------------- #
 
-def quota_probe_due(state: dict, today: str) -> bool:
+def quota_probe_due(state: dict, today: str, month: str) -> bool:
     """Vrai s'il est l'heure de retenter un appel après un quota épuisé.
 
-    Une seule tentative par journée civile, à partir de PV_QUOTA_PROBE_HOUR :
-    le quota est compté à la journée, insister avant son renouvellement ne
-    ferait que gaspiller les appels du lendemain.
+    Le quota est renouvelé le 1er de chaque mois : rien ne sert de réessayer
+    avant. Ensuite, une seule tentative par journée civile, à partir de
+    PV_QUOTA_PROBE_HOUR, au cas où le renouvellement tarderait.
     """
-    return (datetime.now().hour >= QUOTA_PROBE_HOUR
+    since = datetime.fromisoformat(state["quota_exhausted_since"]).astimezone()
+    return (month != since.strftime("%Y-%m")
+            and datetime.now().hour >= QUOTA_PROBE_HOUR
             and state.get("quota_probe_day") != today)
+
+
+# --------------------------------------------------------------------------- #
+# Budget mensuel et cadence des relevés
+# --------------------------------------------------------------------------- #
+
+def calls_per_run(state: dict) -> int:
+    """Appels consommés par un relevé : « details » + un par ECU."""
+    return 1 + state.get("ecu_count", 1)
+
+
+def daylight_minutes(local_now: datetime) -> int:
+    """Minutes de la journée où le soleil dépasse PV_MIN_ELEVATION (pas de 10 min)."""
+    midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return sum(
+        10 for i in range(24 * 6)
+        if solar_elevation(
+            LAT, LON, (midnight + timedelta(minutes=10 * i)).astimezone(timezone.utc)
+        ) >= MIN_ELEVATION
+    )
+
+
+def run_interval(state: dict, local_now: datetime) -> timedelta:
+    """Intervalle entre deux relevés pour tenir PV_MONTHLY_BUDGET sur le mois.
+
+    Le budget quotidien est réparti sur les heures d'ensoleillement du jour :
+    les journées courtes de l'hiver permettent des relevés plus rapprochés.
+    N relevés, du premier au dernier rayon utile, ne délimitent que N - 1
+    intervalles.
+    """
+    days = calendar.monthrange(local_now.year, local_now.month)[1]
+    runs_per_day = MONTHLY_BUDGET / days / calls_per_run(state)
+    minutes = daylight_minutes(local_now) / max(runs_per_day - 1, 1)
+    return timedelta(minutes=max(MIN_INTERVAL_MINUTES, minutes))
+
+
+def idle(state: dict, message: str, dry_run: bool) -> int:
+    """Termine une exécution sans relevé : le script, lui, est bien vivant."""
+    log(message)
+    save_state(state)
+    ping_healthchecks(dry_run)
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -614,25 +701,79 @@ def api_failure(state: dict, exc: Exception, dry_run: bool) -> int:
 def run(dry_run: bool = False) -> int:
     state = load_state()
     now = datetime.now(timezone.utc)
-    today = datetime.now().strftime("%Y-%m-%d")
+    local_now = now.astimezone()
+    today = local_now.strftime("%Y-%m-%d")
+    month = local_now.strftime("%Y-%m")
     elevation = solar_elevation(LAT, LON, now)
+
+    # --- Compteur d'appels, remis à zéro avec le quota le 1er du mois ------- #
+    if state.get("calls_month") != month:
+        state["calls_month"] = month
+        state["calls_count"] = 0
+        if state.pop("budget_paused_since", None):
+            log("[budget] Nouveau mois — reprise des relevés.")
+            if not dry_run:
+                notify(
+                    "✅ Surveillance PV : reprise des relevés",
+                    "Nouveau mois : le budget d'appels API est renouvelé, la "
+                    "surveillance reprend.",
+                    urgent=False,
+                )
 
     # --- 0. Veille pour cause de quota épuisé ------------------------------- #
     quota_since = state.get("quota_exhausted_since")
-    if quota_since and not quota_probe_due(state, today):
-        log(f"[quota] Quota d'appels épuisé depuis {quota_since} — surveillance "
-            f"en veille, prochain essai à {QUOTA_PROBE_HOUR}h.")
-        ping_healthchecks(dry_run)
-        return 0
+    if quota_since and not quota_probe_due(state, today, month):
+        return idle(state, f"[quota] Quota d'appels épuisé depuis {quota_since} — "
+                    f"surveillance en veille, un essai par jour à {QUOTA_PROBE_HOUR}h "
+                    "à partir du 1er du mois.", dry_run)
+
+    # --- 1. Soleil trop bas : aucune détection possible, aucun appel -------- #
+    # --dry-run passe outre : lancé à la main, on veut voir l'état réel.
+    if elevation < MIN_ELEVATION and not dry_run:
+        return idle(state, f"Soleil : {elevation:.1f}° < {MIN_ELEVATION:.0f}° — "
+                    "pas de relevé.", dry_run)
+
+    # --- 2. Budget mensuel épuisé ------------------------------------------- #
+    used = state["calls_count"]
+    if used + calls_per_run(state) > MONTHLY_BUDGET:
+        if not state.get("budget_paused_since"):
+            state["budget_paused_since"] = now.isoformat()
+            if not dry_run:
+                notify(
+                    "⚠️ Surveillance PV : budget d'appels API atteint",
+                    f"{used} appels sur {MONTHLY_BUDGET} consommés ce mois-ci. "
+                    "La surveillance est suspendue jusqu'au 1er du mois "
+                    "prochain, pour ne pas épuiser le quota APsystems.",
+                )
+        return idle(state, f"[budget] {used}/{MONTHLY_BUDGET} appels ce mois-ci — "
+                    "relevés suspendus jusqu'au 1er du mois.", dry_run)
+
+    # --- 3. Cadence adaptée à la durée du jour ------------------------------ #
+    # Une minute de tolérance : le planificateur réveille le script pile sur
+    # sa grille, mais le relevé précédent a été horodaté quelques secondes
+    # après la sienne.
+    interval = run_interval(state, local_now)
+    last_call = state.get("last_api_call")
+    if last_call and not dry_run and not quota_since:
+        elapsed = now - datetime.fromisoformat(last_call)
+        if elapsed < interval - timedelta(minutes=1):
+            return idle(state, f"Soleil : {elevation:.1f}° | dernier relevé il y a "
+                        f"{elapsed.total_seconds() / 60:.0f} min, intervalle "
+                        f"{interval.total_seconds() / 60:.0f} min | {used}/"
+                        f"{MONTHLY_BUDGET} appels ce mois-ci — pas de relevé.",
+                        dry_run)
+
     if quota_since:
         # Marqué avant l'appel : qu'il réussisse ou non, la tentative du jour
         # est consommée.
         state["quota_probe_day"] = today
+    state["last_api_call"] = now.isoformat()
 
     # --- Appel API, avec tolérance aux pannes passagères -------------------- #
     try:
         snap = collect()
         state["api_failures"] = 0
+        state["ecu_count"] = len(snap["ecus"])
         if state.pop("quota_exhausted_since", None):
             state.pop("quota_probe_day", None)
             log("[quota] Quota d'appels renouvelé — reprise de la cadence normale.")
@@ -653,17 +794,18 @@ def run(dry_run: bool = False) -> int:
         # Ce n'est pas une panne réseau : le compteur d'échecs consécutifs ne
         # doit pas déclencher en plus l'alerte « API injoignable ».
         state["api_failures"] = 0
-        log(f"[quota] {exc} — surveillance en veille, un seul essai par jour "
-            f"à {QUOTA_PROBE_HOUR}h jusqu'au renouvellement.")
+        log(f"[quota] {exc} — surveillance en veille jusqu'au 1er du mois, puis "
+            f"un essai par jour à {QUOTA_PROBE_HOUR}h jusqu'au renouvellement.")
         if first and not dry_run:
             notify(
                 "⚠️ Surveillance PV : quota d'appels APsystems épuisé",
                 f"{exc}\n\nAucune donnée n'est plus lisible tant que le quota "
                 "n'est pas renouvelé : la surveillance de l'installation est "
-                f"suspendue.\n\nLe script retentera un appel une fois par jour, "
-                f"à {QUOTA_PROBE_HOUR}h, et vous préviendra dès que l'accès "
-                "sera rétabli.\n\n👉 Pensez à espacer les relevés "
-                "(PV_INTERVAL_MINUTES) si le quota est atteint régulièrement.",
+                f"suspendue.\n\nLe script retentera un appel le 1er du mois "
+                f"prochain à {QUOTA_PROBE_HOUR}h, et vous préviendra dès que "
+                "l'accès sera rétabli.\n\n👉 Si cela se reproduit, baissez "
+                "PV_MONTHLY_BUDGET : une autre application consomme peut-être "
+                "le même quota.",
             )
         save_state(state)
         ping_healthchecks(dry_run)
@@ -675,12 +817,9 @@ def run(dry_run: bool = False) -> int:
         describe_ecu(eid, power, ts, age)
         for eid, (power, ts, age) in snap["per_ecu"].items()
     )
-    today_kwh = snap["today_kwh"]
-    today_text = f"{today_kwh} kWh" if today_kwh is not None else "pas encore de relevé"
     summary = (
         f"Soleil : {elevation:.1f}°  |  Voyant : {snap['light']} "
-        f"({LIGHT_LABELS.get(snap['light'], '?')})  |  "
-        f"Aujourd'hui : {today_text}  |  ECUs : {ecu_details}"
+        f"({LIGHT_LABELS.get(snap['light'], '?')})  |  ECUs : {ecu_details}"
     )
 
     problems: list[str] = []
@@ -758,7 +897,7 @@ def run(dry_run: bool = False) -> int:
     if problems and not was_alerting:
         message = (
             "\n".join(f"• {p}" for p in problems)
-            + f"\n\nProduction du jour : {today_text}"
+            + f"\n\nProduction du jour : {today_energy_text()}"
             + f"\nPuissance instantanée : " + describe_power(snap["per_ecu"])
             + "\n\n👉 Vérifiez les disjoncteurs PV dans le garage, "
               "puis l'alimentation et le réseau de l'ECU."

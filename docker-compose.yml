@@ -15,9 +15,12 @@ services:
 
     environment:
       TZ: Europe/Paris
-      PV_START_TIME: "07:00"
-      PV_END_TIME: "22:00"
-      PV_INTERVAL_MINUTES: "30"
+      # Plage et cadence de RÉVEIL du script. Il n'appelle l'API que si le
+      # soleil est assez haut et que l'intervalle adapté à la durée du jour
+      # (et au budget mensuel PV_MONTHLY_BUDGET) est écoulé.
+      PV_START_TIME: "06:00"
+      PV_END_TIME: "21:30"
+      PV_INTERVAL_MINUTES: "15"
       PV_STATE_FILE: /data/state.json
       PV_LOG_FILE: /data/apsystems_watchdog.log
       PV_TEST_ON_START: "1"     # passez à 0 une fois la configuration validée

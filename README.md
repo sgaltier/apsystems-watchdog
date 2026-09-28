@@ -1,8 +1,10 @@
 # Surveillance photovoltaïque APsystems — installation sur Synology DS925+
 
-Conteneur Docker qui interroge l'OpenAPI APsystems toutes les 30 minutes entre
-7h00 et 22h00, et vous notifie si la production s'arrête (disjoncteur qui a
-sauté, ECU hors ligne, onduleur en alarme).
+Conteneur Docker qui interroge l'OpenAPI APsystems pendant les heures de
+soleil, et vous notifie si la production s'arrête (disjoncteur qui a sauté,
+ECU hors ligne, onduleur en alarme). La cadence s'adapte à la durée du jour
+pour rester sous le quota de 1000 appels par mois : un relevé toutes les
+30 minutes environ en hiver, toutes les heures environ en été.
 
 ---
 
@@ -72,7 +74,9 @@ votre téléphone dans la foulée.
 Ensuite, à chaque exécution :
 
 ```
-2026-09-01T20:08:34 Soleil : 1.3° | Voyant : 1 (Vert — fonctionnement normal) | Aujourd'hui : 34.71 kWh | ECUs : 215000042894 = 194.0 W à 20:00 (il y a 9 min) | Tout va bien.
+2026-09-01T14:00:02 Soleil : 41.3° | Voyant : 1 (Vert — fonctionnement normal) | ECUs : 215000042894 = 1940.0 W à 13:55 (il y a 5 min) | Tout va bien.
+2026-09-01T14:15:01 Soleil : 39.8° | dernier relevé il y a 15 min, intervalle 48 min | 412/950 appels ce mois-ci — pas de relevé.
+2026-09-01T20:30:01 Soleil : 1.3° < 10° — pas de relevé.
 ```
 
 Une fois validé, passez `PV_TEST_ON_START` à `0` dans `docker-compose.yml`
@@ -87,34 +91,56 @@ Tout se modifie dans `docker-compose.yml` (section `environment`), puis
 
 | Variable              | Défaut       | Rôle                                    |
 |-----------------------|--------------|-----------------------------------------|
-| `PV_START_TIME`       | `07:00`      | Première exécution de la journée        |
-| `PV_END_TIME`         | `22:00`      | Dernière exécution                      |
-| `PV_INTERVAL_MINUTES` | `30`         | Cadence                                 |
+| `PV_START_TIME`       | `06:00`      | Premier réveil de la journée            |
+| `PV_END_TIME`         | `21:30`      | Dernier réveil                          |
+| `PV_INTERVAL_MINUTES` | `15`         | Cadence de réveil (le script décide s'il appelle l'API) |
 | `TZ`                  | Europe/Paris | Fuseau (gère l'heure d'été/hiver)       |
 
 Et dans `config.env` :
 
 | Variable            | Défaut | Rôle                                          |
 |---------------------|--------|-----------------------------------------------|
-| `PV_MIN_ELEVATION`  | `15`   | Hauteur du soleil au-delà de laquelle on attend de la production. **Descendez à 10 en hiver** : à Lyon le soleil culmine vers 20° au solstice. |
+| `PV_LAT` / `PV_LON` | `46.16` / `6.34` | Position de l'installation (Fillinges), pour la hauteur du soleil |
+| `PV_MIN_ELEVATION`  | `15`   | Hauteur du soleil au-delà de laquelle on attend de la production, et en dessous de laquelle l'API n'est pas appelée. **Descendez à 10 en hiver** : à Fillinges le soleil culmine vers 20° au solstice. |
 | `PV_GRACE_MINUTES`  | `60`   | Durée de production nulle avant d'alerter     |
 | `PV_MIN_POWER_W`    | `20`   | Seuil sous lequel on considère la production nulle |
-| `PV_QUOTA_PROBE_HOUR` | `12` | Heure de l'unique essai quotidien quand le quota d'appels est épuisé |
+| `PV_QUOTA_PROBE_HOUR` | `12` | Heure de l'unique essai quotidien, à partir du 1er du mois, quand le quota d'appels est épuisé |
+| `PV_MONTHLY_BUDGET` | `950`  | Appels API autorisés par mois civil (quota APsystems : 1000) |
+| `PV_MIN_INTERVAL_MINUTES` | `30` | Intervalle minimal entre deux relevés |
 
 ---
+
+## Budget d'appels API
+
+Le quota OpenAPI est de 1000 appels par mois, renouvelé le 1er. Un relevé
+coûte 1 appel, plus 1 par ECU ; une alerte en coûte 1 de plus (production du
+jour). Pour tenir le budget, le script :
+
+1. n'appelle **jamais** l'API quand le soleil est sous `PV_MIN_ELEVATION` :
+   aucune panne n'y est détectable, faute de production attendue ;
+2. répartit `PV_MONTHLY_BUDGET` sur les heures de soleil du jour : les
+   relevés sont espacés d'environ 30 min en hiver et d'environ une heure en
+   été ;
+3. compte ses appels et, si le budget est atteint malgré tout (redémarrages
+   répétés, `--dry-run` fréquents), suspend les relevés jusqu'au 1er du mois
+   en vous prévenant une fois.
+
+Contrepartie : en été, une panne est signalée jusqu'à une heure plus tard
+qu'avec un relevé toutes les 30 minutes, et une panne survenue au crépuscule
+n'est signalée que le lendemain matin.
 
 ## Quand le quota d'appels APsystems est épuisé
 
 L'OpenAPI est facturée à l'usage et plafonnée : une fois le quota consommé,
-elle répond `code 2005` à *tous* les appels, et plus rien n'est observable.
-Continuer à interroger toutes les 30 minutes ne ferait qu'entamer le quota du
-lendemain et remplir le journal d'erreurs.
+elle répond `code 2005` à *tous* les appels, et plus rien n'est observable
+jusqu'au 1er du mois suivant.
 
 Le script :
 
 1. vous notifie **une seule fois** (ntfy / Telegram / e-mail) que la
    surveillance est suspendue faute de quota ;
-2. se met en veille et ne retente **qu'un appel par jour, à midi** ;
+2. se met en veille et ne retente **qu'un appel par jour, à midi, à partir
+   du 1er du mois suivant** ;
 3. vous notifie dès que l'appel repasse, et reprend sa cadence normale.
 
 Le ping Healthchecks.io continue pendant la veille : le script est bien vivant,
@@ -151,7 +177,7 @@ votre surveillance, et pas seulement d'une panne de vos panneaux.
 |---|---|
 | `OpenAPI code 3002 (Signature invalide)` | Ajoutez `APS_SIGN_FULL_PATH=1` dans `config.env`. Le manuel définit le champ à signer comme « le dernier segment du chemin », ce qui est ambigu — ce drapeau bascule sur le chemin complet. |
 | `OpenAPI code 2002 / 2004` | Compte OpenAPI non autorisé sur cette catégorie de données. À voir avec APsystems. |
-| `OpenAPI code 2005 (Quota d'appels dépassé)` | Le script vous notifie une fois, puis se met en veille et ne retente qu'un appel par jour, à midi, jusqu'au renouvellement du quota (voir ci-dessous). Pour éviter que cela se reproduise, augmentez `PV_INTERVAL_MINUTES` à 60. |
+| `OpenAPI code 2005 (Quota d'appels dépassé)` | Le script vous notifie une fois, puis se met en veille jusqu'au 1er du mois suivant (voir ci-dessus). Si cela arrive malgré le budget, une autre application consomme sans doute le même quota : baissez `PV_MONTHLY_BUDGET`. |
 | `OpenAPI code 7001 / 7002` | Limite de débit momentanée. Sans gravité si c'est isolé ; sinon espacez les relevés. |
 | `OpenAPI code 1001 (Aucune donnée)` | `APS_SID` incorrect, ou l'ECU n'a jamais remonté de données. |
 | `[!] AUCUN canal de notification n'a fonctionné` | `config.env` vide, mal orthographié, ou syntaxe avec guillemets/espaces. |
