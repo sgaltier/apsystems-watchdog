@@ -17,13 +17,25 @@ services:
       TZ: Europe/Paris
       # Plage et cadence de RÉVEIL du script. Il n'appelle l'API que si le
       # soleil est assez haut et que l'intervalle adapté à la durée du jour
-      # (et au budget mensuel PV_MONTHLY_BUDGET) est écoulé.
-      PV_START_TIME: "06:00"
-      PV_END_TIME: "21:30"
+      # (et au budget mensuel PV_MONTHLY_BUDGET) est écoulé. Réveil jour et
+      # nuit : chaque réveil interroge le service météo pour ne manquer
+      # aucune chute de neige nocturne, sans consommer le quota APsystems.
+      PV_START_TIME: "00:00"
+      PV_END_TIME: "23:59"
       PV_INTERVAL_MINUTES: "15"
       PV_STATE_FILE: /data/state.json
       PV_LOG_FILE: /data/apsystems_watchdog.log
       PV_TEST_ON_START: "1"     # passez à 0 une fois la configuration validée
+      # Service météo local (cf. docs/API.md) : explique une absence de
+      # production par un ciel très sombre ou des panneaux enneigés.
+      WEATHER_API_URL: http://fillinges-weather:8000
+
+    # Le nom fillinges-weather n'est résolu que sur ce réseau, créé par le
+    # projet fillinges-weather : ce dernier doit donc être démarré AVANT,
+    # sinon Docker refuse de lancer ce conteneur.
+    networks:
+      - default
+      - fillinges-weather
 
     volumes:
       # Conserve l'état (anti-spam, "production nulle depuis...") entre les
@@ -52,3 +64,7 @@ services:
 
 volumes:
   pv-data:
+
+networks:
+  fillinges-weather:
+    external: true

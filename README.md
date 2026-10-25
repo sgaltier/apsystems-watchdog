@@ -16,6 +16,10 @@ pour rester sous le quota de 1000 appels par mois : un relevé toutes les
   demander directeemnt sur le site web APsystems.
   **Faites cette démarche en premier** : l'accès n'est pas automatique et peut
   être facturé.
+- Le projet **fillinges-weather** (service météo local, cf.
+  [docs/API.md](docs/API.md)) **démarré avant celui-ci** : le conteneur
+  rejoint son réseau Docker, et Docker refuse de le lancer si ce réseau
+  n'existe pas encore.
 
 ---
 
@@ -91,10 +95,11 @@ Tout se modifie dans `docker-compose.yml` (section `environment`), puis
 
 | Variable              | Défaut       | Rôle                                    |
 |-----------------------|--------------|-----------------------------------------|
-| `PV_START_TIME`       | `06:00`      | Premier réveil de la journée            |
-| `PV_END_TIME`         | `21:30`      | Dernier réveil                          |
+| `PV_START_TIME`       | `00:00`      | Premier réveil de la journée            |
+| `PV_END_TIME`         | `23:59`      | Dernier réveil (jour et nuit, pour détecter la neige nocturne) |
 | `PV_INTERVAL_MINUTES` | `15`         | Cadence de réveil (le script décide s'il appelle l'API) |
 | `TZ`                  | Europe/Paris | Fuseau (gère l'heure d'été/hiver)       |
+| `WEATHER_API_URL`     | `http://fillinges-weather:8000` | Service météo local ; vide = désactivé |
 
 Et dans `config.env` :
 
@@ -107,6 +112,36 @@ Et dans `config.env` :
 | `PV_QUOTA_PROBE_HOUR` | `12` | Heure de l'unique essai quotidien, à partir du 1er du mois, quand le quota d'appels est épuisé |
 | `PV_MONTHLY_BUDGET` | `950`  | Appels API autorisés par mois civil (quota APsystems : 1000) |
 | `PV_MIN_INTERVAL_MINUTES` | `30` | Intervalle minimal entre deux relevés |
+| `PV_MIN_GHI_W_M2`   | `50`   | Rayonnement global sous lequel une absence de production est normale |
+| `PV_SNOW_HOLD_HOURS` | `48`  | Durée pendant laquelle les panneaux sont supposés enneigés après la dernière neige observée |
+| `PV_MAX_WEATHER_AGE_MINUTES` | `60` | Âge maximal d'une mesure météo prise en compte |
+
+---
+
+## Absence de production expliquée par la météo
+
+À chaque réveil, le script interroge le service local fillinges-weather. Une
+absence de production (puissance nulle, données figées, voyant gris) n'est
+**pas** signalée quand :
+
+- le rayonnement global mesuré est sous `PV_MIN_GHI_W_M2` : ciel très sombre ;
+- de la neige a été observée depuis moins de `PV_SNOW_HOLD_HOURS` : panneaux
+  probablement couverts. Cette exemption tombe dès que la production reprend
+  sur tous les ECUs.
+
+Le journal l'indique (`-> absence de production attendue : ...`) et affiche le
+rayonnement à chaque relevé, ce qui permet d'ajuster le seuil.
+
+Si le service météo est injoignable, l'échec est journalisé (`[météo] service
+... indisponible`) et le script alerte comme s'il n'existait pas : une panne
+de la météo ne fait jamais taire une alerte.
+
+Le seuil de 50 W/m² vise des modules SOLARWATT vision AM 4.0 de 405 Wc sur
+micro-onduleurs DS3 : un module délivre 79,5 W sous 200 W/m², soit environ
+18 W par module sous 50 W/m², ce qui dépasse déjà `PV_MIN_POWER_W` pour un
+seul DS3. La marge couvre l'imprécision du rayonnement mesuré (pixel
+satellite, moyenne sur 10 à 15 min, station de Genève à 20 km, panneaux
+inclinés et non horizontaux).
 
 ---
 
@@ -183,6 +218,8 @@ votre surveillance, et pas seulement d'une panne de vos panneaux.
 | `[!] AUCUN canal de notification n'a fonctionné` | `config.env` vide, mal orthographié, ou syntaxe avec guillemets/espaces. |
 | Alertes en pleine nuit | `TZ` mal pris en compte. Vérifiez la ligne « il est HH:MM » au démarrage du journal. |
 | Fausses alertes en hiver | Baissez `PV_MIN_ELEVATION` à 10 et montez `PV_GRACE_MINUTES` à 90. |
+| `[météo] service ... indisponible` | Le projet fillinges-weather est arrêté, ou ce conteneur n'est pas sur le réseau `fillinges-weather`. Les alertes partent quand même, sans exemption météo. |
+| `network fillinges-weather declared as external, but could not be found` | Démarrez le projet fillinges-weather avant celui-ci. |
 | Onglet **Journal** vide alors que le conteneur tourne | Une section `logging:` dans `docker-compose.yml` détourne la sortie vers un pilote que DSM ne lit pas. Retirez-la, puis **supprimez et recréez** le conteneur : le pilote de journalisation est figé à sa création, un simple redémarrage ne suffit pas. |
 
 Pour tester la chaîne de notification sans attendre :

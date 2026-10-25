@@ -34,6 +34,12 @@ Détecte :
      montée en production du matin -- : tant que la production reste normale,
      il faut deux relevés jaunes consécutifs pour déclencher l'alerte.
   2. Une puissance instantanée nulle alors que le soleil est suffisamment haut.
+     Si le service météo local fillinges-weather est configuré, une absence de
+     production n'est pas signalée quand elle s'explique : rayonnement trop
+     faible (ciel très sombre) ou neige observée récemment, les panneaux étant
+     alors probablement couverts. Cette exemption vaut aussi pour les
+     détections 3 et 1 (voyant gris), qui en sont la conséquence : des
+     micro-onduleurs qui ne reçoivent rien ne remontent plus rien.
   3. Des données figées : l'API continue de renvoyer le DERNIER point connu même
      quand l'ECU ne remonte plus rien. C'est ce cas -- et non une puissance
      nulle -- qui se produit réellement quand le disjoncteur saute ou que
@@ -112,6 +118,19 @@ Réglages (facultatifs) :
   PV_STATE_FILE       Fichier d'état. Défaut ~/.apsystems_watchdog.json
   PV_LOG_FILE         Fichier de log. Défaut ~/.apsystems_watchdog.log
   HEALTHCHECKS_URL    URL de ping Healthchecks.io (dead man's switch)
+
+Météo locale (facultatif, service fillinges-weather) :
+  WEATHER_API_URL     Ex. http://fillinges-weather:8000. Vide = pas de météo :
+                      toute absence de production est signalée. Service
+                      injoignable = idem, et l'échec est journalisé.
+  PV_MIN_GHI_W_M2     Rayonnement global (W/m²) sous lequel une absence de
+                      production est attendue. Défaut 50.
+  PV_SNOW_HOLD_HOURS  Durée pendant laquelle les panneaux sont supposés
+                      couverts après la dernière neige observée, sauf si la
+                      production reprend avant. Défaut 48 h.
+  PV_MAX_WEATHER_AGE_MINUTES
+                      Âge maximal d'une mesure météo pour être prise en
+                      compte. Défaut 60 min.
 
 Usage :
   python3 apsystems_watchdog.py              # une passe (à mettre en cron)
@@ -210,6 +229,11 @@ STATE_FILE = Path(os.getenv("PV_STATE_FILE", "./apsystems_watchdog.json")).expan
 LOG_FILE = Path(os.getenv("PV_LOG_FILE", "./apsystems_watchdog.log")).expanduser()
 HEALTHCHECKS_URL = os.getenv("HEALTHCHECKS_URL", "")
 
+WEATHER_API_URL = os.getenv("WEATHER_API_URL", "").rstrip("/")
+MIN_GHI_W_M2 = float(os.getenv("PV_MIN_GHI_W_M2", "50"))
+SNOW_HOLD_HOURS = float(os.getenv("PV_SNOW_HOLD_HOURS", "48"))
+MAX_WEATHER_AGE_MINUTES = int(os.getenv("PV_MAX_WEATHER_AGE_MINUTES", "60"))
+
 # Notifications (au moins un canal)
 NTFY_TOPIC = os.getenv("NTFY_TOPIC")
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh")
@@ -228,6 +252,7 @@ SMTP_TO = os.getenv("SMTP_TO", "")
 SIGN_FULL_PATH = os.getenv("APS_SIGN_FULL_PATH", "0") == "1"
 
 TIMEOUT = 20
+WEATHER_TIMEOUT = 5
 
 
 # --------------------------------------------------------------------------- #
@@ -364,6 +389,91 @@ def solar_elevation(lat: float, lon: float, when_utc: datetime) -> float:
     latr = math.radians(lat)
     cosz = math.sin(latr) * math.sin(decl) + math.cos(latr) * math.cos(decl) * math.cos(ha)
     return math.degrees(math.asin(max(-1.0, min(1.0, cosz))))
+
+
+# --------------------------------------------------------------------------- #
+# Météo locale (service fillinges-weather, cf. docs/API.md) -- distingue une
+# absence de production normale (ciel très sombre, panneaux enneigés) d'une
+# vraie panne.
+# --------------------------------------------------------------------------- #
+
+SNOW_TYPES = ("snow", "mixed")
+
+
+def current_weather() -> dict | None:
+    """Réponse de GET /current, ou None si le service n'est pas utilisable.
+
+    Sans météo, toute absence de production est signalée comme avant : une
+    panne du service météo ne doit jamais faire taire une alerte.
+    """
+    if not WEATHER_API_URL:
+        return None
+    try:
+        with urllib.request.urlopen(f"{WEATHER_API_URL}/current",
+                                    timeout=WEATHER_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        log(f"[météo] service {WEATHER_API_URL} indisponible : {exc}", err=True)
+        return None
+
+
+def fresh_block(weather: dict | None, name: str) -> dict | None:
+    """Bloc `name` de la météo, ou None s'il manque ou si sa mesure est trop vieille.
+
+    Un bloc dégradé (aucune source) n'a pas de champ age_minutes : il est donc
+    écarté lui aussi.
+    """
+    block = (weather or {}).get(name) or {}
+    age = block.get("age_minutes")
+    if age is None or age > MAX_WEATHER_AGE_MINUTES:
+        return None
+    return block
+
+
+def global_irradiance(weather: dict | None) -> float | None:
+    """Rayonnement global horizontal récent (W/m²), ou None."""
+    sunshine = fresh_block(weather, "sunshine")
+    return sunshine.get("ghi_w_m2") if sunshine else None
+
+
+def describe_irradiance(weather: dict | None) -> str:
+    ghi = global_irradiance(weather)
+    if ghi is None:
+        return "indisponible"
+    sunshine = weather["sunshine"]
+    return (f"{ghi:.0f} W/m² ({sunshine.get('source', '?')}, "
+            f"il y a {sunshine['age_minutes']:.0f} min)")
+
+
+def note_snow(state: dict, weather: dict | None, now: datetime) -> None:
+    """Mémorise la dernière neige observée.
+
+    Appelé à chaque réveil, même sans relevé APsystems : la neige tombe
+    souvent la nuit ou au petit matin, et le service ne renseigne que sur
+    l'instant présent.
+    """
+    precipitation = fresh_block(weather, "precipitation")
+    if not precipitation or precipitation.get("type") not in SNOW_TYPES:
+        return
+    if not state.get("last_snow"):
+        log(f"[météo] Neige observée ({precipitation.get('rate_mm_h')} mm/h) — "
+            f"une absence de production sera tenue pour normale pendant "
+            f"{SNOW_HOLD_HOURS:.0f} h, ou jusqu'à la reprise de la production.")
+    state["last_snow"] = now.isoformat()
+
+
+def no_production_reason(state: dict, weather: dict | None, now: datetime) -> str | None:
+    """Raison météo pour laquelle une absence de production est normale, ou None."""
+    last_snow = state.get("last_snow")
+    if last_snow:
+        since = now - datetime.fromisoformat(last_snow)
+        if since < timedelta(hours=SNOW_HOLD_HOURS):
+            return (f"neige observée il y a {since.total_seconds() / 3600:.0f} h, "
+                    "panneaux probablement couverts")
+    ghi = global_irradiance(weather)
+    if ghi is not None and ghi < MIN_GHI_W_M2:
+        return f"rayonnement {describe_irradiance(weather)} < {MIN_GHI_W_M2:.0f} W/m²"
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -706,6 +816,11 @@ def run(dry_run: bool = False) -> int:
     month = local_now.strftime("%Y-%m")
     elevation = solar_elevation(LAT, LON, now)
 
+    # --- Météo locale : à chaque réveil, même sans relevé, pour ne manquer
+    # aucune chute de neige. Le service ne consomme pas le quota APsystems.
+    weather = current_weather()
+    note_snow(state, weather, now)
+
     # --- Compteur d'appels, remis à zéro avec le quota le 1er du mois ------- #
     if state.get("calls_month") != month:
         state["calls_month"] = month
@@ -821,21 +936,42 @@ def run(dry_run: bool = False) -> int:
         f"Soleil : {elevation:.1f}°  |  Voyant : {snap['light']} "
         f"({LIGHT_LABELS.get(snap['light'], '?')})  |  ECUs : {ecu_details}"
     )
+    if WEATHER_API_URL:
+        summary += f"  |  Rayonnement : {describe_irradiance(weather)}"
 
     problems: list[str] = []
 
-    # --- 1. Voyant système rouge ou gris ------------------------------------ #
-    # Le jaune est traité plus bas : il exige une confirmation.
-    if snap["light"] in (3, 4):
-        problems.append(f"Voyant système : {LIGHT_LABELS[snap['light']]}.")
-
-    # --- 2. Production nulle en plein soleil -------------------------------- #
     zero_ecus = [
         eid for eid, (power, _, _) in snap["per_ecu"].items()
         if power is not None and power < MIN_POWER_W
     ]
+    stale_ecus = [
+        (eid, age) for eid, (_, _, age) in snap["per_ecu"].items()
+        if age is not None and age > MAX_DATA_AGE_MINUTES
+    ]
+    # Un ECU muet depuis minuit ne produit aucun point du tout : l'API répond
+    # "aucune donnée" et non un point périmé. Sans ce cas, une panne survenue de
+    # nuit resterait invisible toute la journée suivante.
+    silent_ecus = [eid for eid, (_, ts, _) in snap["per_ecu"].items() if ts is None]
 
-    if elevation >= MIN_ELEVATION and zero_ecus:
+    # --- Absence de production expliquée par la météo ----------------------- #
+    # Une production revenue partout prouve que les panneaux sont dégagés : la
+    # neige mémorisée n'excuse plus rien.
+    if all(power is not None and power >= MIN_POWER_W
+           for power, _, _ in snap["per_ecu"].values()):
+        state.pop("last_snow", None)
+    expected = no_production_reason(state, weather, now)
+    if expected and (zero_ecus or stale_ecus or silent_ecus or snap["light"] == 4):
+        log(f"  -> absence de production attendue : {expected}")
+
+    # --- 1. Voyant système rouge ou gris ------------------------------------ #
+    # Le jaune est traité plus bas : il exige une confirmation. Le gris
+    # (aucune donnée) est normal quand les panneaux ne reçoivent rien.
+    if snap["light"] == 3 or (snap["light"] == 4 and not expected):
+        problems.append(f"Voyant système : {LIGHT_LABELS[snap['light']]}.")
+
+    # --- 2. Production nulle en plein soleil -------------------------------- #
+    if elevation >= MIN_ELEVATION and zero_ecus and not expected:
         first_seen = state.get("zero_since")
         if not first_seen:
             state["zero_since"] = now.isoformat()
@@ -855,16 +991,7 @@ def run(dry_run: bool = False) -> int:
     # --- 3. Données figées : l'ECU ne remonte plus rien --------------------- #
     # C'est LE symptôme réel d'un débranchement ou d'un disjoncteur qui a sauté :
     # la puissance ne tombe pas à zéro, elle cesse simplement d'être mise à jour.
-    stale_ecus = [
-        (eid, age) for eid, (_, _, age) in snap["per_ecu"].items()
-        if age is not None and age > MAX_DATA_AGE_MINUTES
-    ]
-    # Un ECU muet depuis minuit ne produit aucun point du tout : l'API répond
-    # "aucune donnée" et non un point périmé. Sans ce cas, une panne survenue de
-    # nuit resterait invisible toute la journée suivante.
-    silent_ecus = [eid for eid, (_, ts, _) in snap["per_ecu"].items() if ts is None]
-
-    if elevation >= MIN_ELEVATION and (stale_ecus or silent_ecus):
+    if elevation >= MIN_ELEVATION and (stale_ecus or silent_ecus) and not expected:
         noms = ", ".join(
             [f"{eid} (dernier point il y a {age:.0f} min)" for eid, age in stale_ecus]
             + [f"{eid} (aucun point depuis minuit)" for eid in silent_ecus]
@@ -899,6 +1026,8 @@ def run(dry_run: bool = False) -> int:
             "\n".join(f"• {p}" for p in problems)
             + f"\n\nProduction du jour : {today_energy_text()}"
             + f"\nPuissance instantanée : " + describe_power(snap["per_ecu"])
+            + (f"\nRayonnement solaire : {describe_irradiance(weather)}"
+               if WEATHER_API_URL else "")
             + "\n\n👉 Vérifiez les disjoncteurs PV dans le garage, "
               "puis l'alimentation et le réseau de l'ECU."
         )
