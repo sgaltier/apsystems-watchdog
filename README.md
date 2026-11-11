@@ -108,6 +108,7 @@ Et dans `config.env` :
 | `PV_LAT` / `PV_LON` | `46.16` / `6.34` | Position de l'installation (Fillinges), pour la hauteur du soleil |
 | `PV_MIN_ELEVATION`  | `15`   | Hauteur du soleil au-delà de laquelle on attend de la production, et en dessous de laquelle l'API n'est pas appelée. **Descendez à 10 en hiver** : à Fillinges le soleil culmine vers 20° au solstice. |
 | `PV_GRACE_MINUTES`  | `60`   | Durée de production nulle avant d'alerter     |
+| `PV_LIGHT2_GRACE_MINUTES` | `150` | Durée de voyant jaune, production normale, avant d'alerter. Par temps couvert, l'alarme passagère du matin peut durer plus d'une heure. |
 | `PV_MIN_POWER_W`    | `20`   | Seuil sous lequel on considère la production nulle |
 | `PV_QUOTA_PROBE_HOUR` | `12` | Heure de l'unique essai quotidien, à partir du 1er du mois, quand le quota d'appels est épuisé |
 | `PV_MONTHLY_BUDGET` | `950`  | Appels API autorisés par mois civil (quota APsystems : 1000) |

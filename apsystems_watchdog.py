@@ -31,8 +31,9 @@ Détecte :
      paresseusement par le cloud APsystems, il ne suffit pas à lui seul. Le
      jaune (2) est de surcroît sujet aux faux positifs -- un micro-onduleur qui
      se met brièvement en alarme, typiquement en surtension réseau pendant la
-     montée en production du matin -- : tant que la production reste normale,
-     il faut deux relevés jaunes consécutifs pour déclencher l'alerte.
+     montée en production du matin, qui s'éternise par temps couvert -- :
+     tant que la production reste normale, le jaune doit persister
+     PV_LIGHT2_GRACE_MINUTES pour déclencher l'alerte.
   2. Une puissance instantanée nulle alors que le soleil est suffisamment haut.
      Si le service météo local fillinges-weather est configuré, une absence de
      production n'est pas signalée quand elle s'explique : rayonnement trop
@@ -105,6 +106,9 @@ Réglages (facultatifs) :
                       la production. Défaut 15.
   PV_MIN_POWER_W      Seuil de puissance considéré comme "nul". Défaut 20 W.
   PV_GRACE_MINUTES    Durée de production nulle avant alerte. Défaut 60 min.
+  PV_LIGHT2_GRACE_MINUTES
+                      Durée de voyant jaune, production normale, avant alerte.
+                      Défaut 150 min.
   PV_MAX_DATA_AGE_MINUTES
                       Âge maximal du dernier point de télémétrie avant de
                       considérer que l'ECU ne remonte plus rien. Défaut 20 min
@@ -219,6 +223,7 @@ LON = float(os.getenv("PV_LON", "6.34"))
 MIN_ELEVATION = float(os.getenv("PV_MIN_ELEVATION", "15"))
 MIN_POWER_W = float(os.getenv("PV_MIN_POWER_W", "20"))
 GRACE_MINUTES = int(os.getenv("PV_GRACE_MINUTES", "60"))
+LIGHT2_GRACE_MINUTES = int(os.getenv("PV_LIGHT2_GRACE_MINUTES", "150"))
 MAX_API_FAILURES = int(os.getenv("PV_MAX_API_FAILURES", "3"))
 MAX_DATA_AGE_MINUTES = int(os.getenv("PV_MAX_DATA_AGE_MINUTES", "20"))
 QUOTA_PROBE_HOUR = int(os.getenv("PV_QUOTA_PROBE_HOUR", "12"))
@@ -579,10 +584,6 @@ LIGHT_LABELS = {
     3: "Rouge — problème de connexion réseau de l'ECU",
     4: "Gris — aucune donnée remontée par l'ECU",
 }
-
-# Nombre de relevés jaunes consécutifs exigés avant d'alerter quand rien d'autre
-# ne cloche. Le rouge et le gris, eux, alertent dès le premier relevé.
-LIGHT2_CONFIRMATIONS = 2
 
 
 def latest_power_w(sid: str, eid: str, day: str) -> tuple[float | None, str | None]:
@@ -1005,18 +1006,21 @@ def run(dry_run: bool = False) -> int:
     # --- 4. Voyant jaune : confirmation exigée si la production est normale -- #
     # Un micro-onduleur qui se met brièvement en alarme (surtension réseau au
     # moment où la production monte, le matin) fait clignoter le voyant jaune
-    # sans rien coûter en énergie. Tant que les contrôles ci-dessus ne relèvent
-    # rien, on attend un second relevé jaune consécutif avant d'alerter.
+    # sans rien coûter en énergie. Par temps couvert, cette montée s'étire sur
+    # une à deux heures. Tant que les contrôles ci-dessus ne relèvent rien, on
+    # attend donc que le jaune persiste PV_LIGHT2_GRACE_MINUTES : une durée, et
+    # non un nombre de relevés, dont l'espacement varie avec les saisons.
     if snap["light"] == 2:
-        streak = state.get("light2_streak", 0) + 1
-        state["light2_streak"] = streak
-        if problems or streak >= LIGHT2_CONFIRMATIONS:
-            problems.append(f"Voyant système : {LIGHT_LABELS[2]}.")
+        first_seen = state.setdefault("light2_since", now.isoformat())
+        elapsed = int((now - datetime.fromisoformat(first_seen)).total_seconds() // 60)
+        if problems or elapsed >= LIGHT2_GRACE_MINUTES:
+            problems.append(f"Voyant système : {LIGHT_LABELS[2]} "
+                            f"(depuis {elapsed} min).")
         else:
-            log(f"  -> voyant jaune ({streak}/{LIGHT2_CONFIRMATIONS}), production "
-                f"normale : confirmation attendue au prochain relevé")
+            log(f"  -> voyant jaune depuis {elapsed} min, production normale : "
+                f"alerte s'il persiste {LIGHT2_GRACE_MINUTES} min")
     else:
-        state.pop("light2_streak", None)
+        state.pop("light2_since", None)
 
     # --- 5. Notification (une seule par incident, + retour à la normale) ---- #
     was_alerting = state.get("alerting", False)
