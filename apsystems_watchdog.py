@@ -33,7 +33,9 @@ Détecte :
      se met brièvement en alarme, typiquement en surtension réseau pendant la
      montée en production du matin, qui s'éternise par temps couvert -- :
      tant que la production reste normale, le jaune doit persister
-     PV_LIGHT2_GRACE_MINUTES pour déclencher l'alerte.
+     PV_LIGHT2_GRACE_MINUTES pour déclencher l'alerte. Par faible luminosité
+     mesurée (service météo), il est seulement journalisé : les
+     micro-onduleurs s'y mettent en alarme des heures durant sans panne.
   2. Une puissance instantanée nulle alors que le soleil est suffisamment haut.
      Si le service météo local fillinges-weather est configuré, une absence de
      production n'est pas signalée quand elle s'explique : rayonnement trop
@@ -109,6 +111,11 @@ Réglages (facultatifs) :
   PV_LIGHT2_GRACE_MINUTES
                       Durée de voyant jaune, production normale, avant alerte.
                       Défaut 150 min.
+  PV_LIGHT2_MIN_GHI_W_M2
+                      Rayonnement global (W/m²) sous lequel un voyant jaune,
+                      production normale, est seulement journalisé, sans
+                      compter dans la durée ci-dessus. Défaut 150. Sans
+                      météo disponible, le jaune compte toujours.
   PV_MAX_DATA_AGE_MINUTES
                       Âge maximal du dernier point de télémétrie avant de
                       considérer que l'ECU ne remonte plus rien. Défaut 20 min
@@ -224,6 +231,7 @@ MIN_ELEVATION = float(os.getenv("PV_MIN_ELEVATION", "15"))
 MIN_POWER_W = float(os.getenv("PV_MIN_POWER_W", "20"))
 GRACE_MINUTES = int(os.getenv("PV_GRACE_MINUTES", "60"))
 LIGHT2_GRACE_MINUTES = int(os.getenv("PV_LIGHT2_GRACE_MINUTES", "150"))
+LIGHT2_MIN_GHI_W_M2 = float(os.getenv("PV_LIGHT2_MIN_GHI_W_M2", "150"))
 MAX_API_FAILURES = int(os.getenv("PV_MAX_API_FAILURES", "3"))
 MAX_DATA_AGE_MINUTES = int(os.getenv("PV_MAX_DATA_AGE_MINUTES", "20"))
 QUOTA_PROBE_HOUR = int(os.getenv("PV_QUOTA_PROBE_HOUR", "12"))
@@ -1010,7 +1018,15 @@ def run(dry_run: bool = False) -> int:
     # une à deux heures. Tant que les contrôles ci-dessus ne relèvent rien, on
     # attend donc que le jaune persiste PV_LIGHT2_GRACE_MINUTES : une durée, et
     # non un nombre de relevés, dont l'espacement varie avec les saisons.
-    if snap["light"] == 2:
+    # Par faible luminosité, le jaune peut tenir toute une journée grise sans
+    # panne : on le note sans compter ce temps, qui repart de zéro une fois la
+    # lumière revenue.
+    ghi = global_irradiance(weather)
+    if snap["light"] == 2 and not problems and ghi is not None and ghi < LIGHT2_MIN_GHI_W_M2:
+        state.pop("light2_since", None)
+        log(f"  -> voyant jaune par faible luminosité ({describe_irradiance(weather)} "
+            f"< {LIGHT2_MIN_GHI_W_M2:.0f} W/m²), production normale : pas d'alerte")
+    elif snap["light"] == 2:
         first_seen = state.setdefault("light2_since", now.isoformat())
         elapsed = int((now - datetime.fromisoformat(first_seen)).total_seconds() // 60)
         if problems or elapsed >= LIGHT2_GRACE_MINUTES:
