@@ -844,6 +844,15 @@ def run(dry_run: bool = False) -> int:
                     urgent=False,
                 )
 
+    # --- Soleil trop bas : plus rien n'est observé jusqu'au lendemain ------- #
+    # Un début de production nulle ou de voyant jaune relevé le soir ne doit
+    # pas consommer pendant la nuit le délai de grâce : sans cela, le premier
+    # relevé du matin alerterait aussitôt. Placé avant la veille de quota, qui
+    # suspend aussi les relevés.
+    if elevation < MIN_ELEVATION:
+        state.pop("zero_since", None)
+        state.pop("light2_since", None)
+
     # --- 0. Veille pour cause de quota épuisé ------------------------------- #
     quota_since = state.get("quota_exhausted_since")
     if quota_since and not quota_probe_due(state, today, month):
